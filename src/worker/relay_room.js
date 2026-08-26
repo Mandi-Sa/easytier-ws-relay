@@ -1,32 +1,60 @@
 import { Buffer } from 'buffer';
-import { parseHeader } from './core/packet.js';
+import { parseHeader, bufferFromMessage } from './core/packet.js';
 import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
 import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
-import { getPeerManager } from './core/peer_manager.js';
+import { PeerManager } from './core/peer_manager.js';
 import { randomU64String } from './core/crypto.js';
+import {
+  applyWorkerEnv,
+  getWsPath,
+  persistSocketMeta,
+  debugLog,
+  connectionLimit,
+  shouldAcceptConnection,
+} from './core/env.js';
 
 export class RelayRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    applyWorkerEnv(env);
     this.types = loadProtos();
-    this.peerManager = getPeerManager();
+    this.peerManager = new PeerManager();
     this.peerManager.setTypes(this.types);
+    if (env && env.EASYTIER_DISABLE_RELAY !== undefined) {
+      this.peerManager.setPureP2PMode(env.EASYTIER_DISABLE_RELAY === '1');
+    }
+    this.ready = this._boot();
+  }
 
-    // Restore sockets after hibernation to keep metadata
+  async _boot() {
+    try {
+      await this.peerManager.hydrateIdentity(this.state.storage);
+    } catch (e) {
+      console.error('hydrateIdentity failed:', e);
+    }
+    // EasyTier Ping payloads vary, so WebSocket auto-response cannot match them.
     this.state.getWebSockets().forEach((ws) => this._restoreSocket(ws));
   }
 
   async fetch(request) {
+    await this.ready;
     const url = new URL(request.url);
-    const wsPath = '/' + this.env.WS_PATH || '/ws';
-    if (url.pathname !== wsPath) {
+    if (url.pathname === '/stats') {
+      return Response.json(this.peerManager.getStats());
+    }
+    const wsPath = getWsPath(this.env);
+    if (url.pathname !== wsPath && url.pathname !== wsPath + '/') {
       return new Response('Not found', { status: 404 });
     }
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected websocket', { status: 400 });
+    }
+    const max = connectionLimit(this.env);
+    if (!shouldAcceptConnection(this.state.getWebSockets().length, max)) {
+      return new Response('too many connections', { status: 503 });
     }
 
     const pair = new WebSocketPair();
@@ -43,63 +71,46 @@ export class RelayRoom {
   }
 
   async webSocketMessage(ws, message) {
+    await this.ready;
     try {
-      let buffer = null;
-      if (message instanceof ArrayBuffer) {
-        buffer = Buffer.from(message);
-      } else if (message instanceof Uint8Array) {
-        buffer = Buffer.from(message);
-      } else if (ArrayBuffer.isView(message) && message.buffer) {
-        buffer = Buffer.from(message.buffer);
-      } else {
+      const buffer = bufferFromMessage(message);
+      if (!buffer) {
         console.warn('[ws] unsupported message type', typeof message);
         return;
       }
-      console.log(`[ws] recv len=${buffer.length}`);
+      debugLog(`[ws] recv len=${buffer.length}`);
       ws.lastSeen = Date.now();
       const header = parseHeader(buffer);
       if (!header) {
-        console.error('[ws] parseHeader failed, raw hex=', buffer.toString('hex'));
+        debugLog('[ws] parseHeader failed');
         return;
       }
-      console.log(`[ws] header from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
+      debugLog(`[ws] header from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
       const payload = buffer.subarray(HEADER_SIZE);
       switch (header.packetType) {
         case PacketType.HandShake:
-          console.log(`[ws] -> handleHandshake payload hex=${payload.toString('hex')}`);
-          handleHandshake(ws, header, payload, this.types);
+          handleHandshake(ws, header, payload, this.types, this.peerManager);
           break;
         case PacketType.Ping:
           handlePing(ws, header, payload);
           break;
         case PacketType.RpcReq:
-          if (header.toPeerId !== PacketType.Invalid && header.toPeerId !== undefined && header.toPeerId !== null && header.toPeerId !== 0 && header.toPeerId !== PacketType.Invalid && header.toPeerId !== undefined && header.toPeerId !== null && header.toPeerId !== 0 && header.toPeerId !== PacketType.Invalid) {
-            // fallthrough handled below; guard keeps eslint quiet
-          }
-          if (header.toPeerId === PacketType.Invalid /* never true */) {
-            // no-op
-          }
-          if (header.toPeerId === undefined || header.toPeerId === null) {
-            handleRpcReq(ws, header, payload, this.types);
+          if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
+            handleRpcReq(ws, header, payload, this.types, this.peerManager);
             break;
           }
-          if (header.toPeerId === MY_PEER_ID) {
-            handleRpcReq(ws, header, payload, this.types);
-            break;
-          }
-          handleForwarding(ws, header, buffer, this.types);
+          handleForwarding(ws, header, buffer, this.types, this.peerManager);
           break;
         case PacketType.RpcResp:
           if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
-            handleRpcResp(ws, header, payload, this.types);
+            handleRpcResp(ws, header, payload, this.types, this.peerManager);
             break;
           }
+          handleForwarding(ws, header, buffer, this.types, this.peerManager);
+          break;
         case PacketType.Data:
         default:
-          if (header.packetType !== PacketType.Data) {
-            console.log(`[ws] -> forward type=${header.packetType} len=${payload.length}`);
-          }
-          handleForwarding(ws, header, buffer, this.types);
+          handleForwarding(ws, header, buffer, this.types, this.peerManager);
       }
     } catch (e) {
       console.error('relay_room message handling error:', e);
@@ -108,6 +119,7 @@ export class RelayRoom {
   }
 
   async webSocketClose(ws) {
+    await this.ready;
     if (ws.peerId) {
       const groupKey = ws.groupKey;
       const removed = this.peerManager.removePeer(ws);
@@ -131,16 +143,14 @@ export class RelayRoom {
     ws.serverSessionId = meta.serverSessionId || randomU64String();
     ws.weAreInitiator = false;
     ws.crypto = { enabled: false };
-    ws.serializeAttachment?.({
-      peerId: ws.peerId,
-      groupKey: ws.groupKey,
-      domainName: ws.domainName,
-      serverSessionId: ws.serverSessionId,
-    });
+    persistSocketMeta(ws);
   }
 
   _restoreSocket(ws) {
     const meta = ws.deserializeAttachment ? (ws.deserializeAttachment() || {}) : {};
     this._initSocket(ws, meta);
+    if (ws.peerId) {
+      this.peerManager.addPeer(ws.peerId, ws);
+    }
   }
 }

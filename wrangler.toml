@@ -6,7 +6,10 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 WS_PATH = "ws"
 EASYTIER_DISABLE_RELAY = "0"
-EASYTIER_COMPRESS_RPC = "1"
+EASYTIER_COMPRESS_RPC = "0"
+EASYTIER_PUBLIC_SERVER_NETWORK_NAME = "public_server"
+EASYTIER_DEBUG = "0"
+EASYTIER_MAX_CONNECTIONS = "256"
 
 [durable_objects]
 bindings = [

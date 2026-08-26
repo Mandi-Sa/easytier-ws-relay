@@ -1,7 +1,24 @@
 import { HEADER_SIZE } from './constants.js';
 
+export function bufferFromMessage(message) {
+  if (message instanceof ArrayBuffer) {
+    return Buffer.from(message);
+  }
+  if (ArrayBuffer.isView(message)) {
+    return Buffer.from(message.buffer, message.byteOffset, message.byteLength);
+  }
+  if (Buffer.isBuffer(message)) {
+    return message;
+  }
+  return null;
+}
+
 export function parseHeader(buffer) {
   if (!buffer || buffer.length < HEADER_SIZE) return null;
+  const len = buffer.readUInt32LE(12);
+  if (!Number.isFinite(len) || len < 0 || buffer.length !== HEADER_SIZE + len) {
+    return null;
+  }
   return {
     fromPeerId: buffer.readUInt32LE(0),
     toPeerId: buffer.readUInt32LE(4),
@@ -9,7 +26,7 @@ export function parseHeader(buffer) {
     flags: buffer.readUInt8(9),
     forwardCounter: buffer.readUInt8(10),
     reserved: buffer.readUInt8(11),
-    len: buffer.readUInt32LE(12),
+    len,
   };
 }
 

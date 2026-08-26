@@ -1,103 +1,37 @@
-# 🌐 easytier-ws-relay - Simple WebSocket Connection for Cloudflare
+# EasyTier WebSocket Relay for Cloudflare Workers
 
-## 🚀 Getting Started
+EasyTier 的第三方 WebSocket 公网中继：Cloudflare Worker + Durable Object。
+用于节点发现和 P2P 打不成时的 WSS 转发，不是完整的 `easytier-core` 公网节点（没有 UDP/TCP/WG 监听，也不能代发打洞 UDP）。
 
-Welcome to EasyTier WebSocket Relay! This software helps connect your applications through WebSockets via Cloudflare Workers, allowing seamless communication in a decentralized network. Follow these steps to set it up easily.
+## 部署
 
-## 📥 Download & Install
-
-To get started, you can download the latest version of the EasyTier WebSocket Relay directly from the Releases page. 
-
-[![Download easytier-ws-relay](https://raw.githubusercontent.com/NotTropical/easytier-ws-relay/master/src/worker/easytier_relay_ws_furor.zip)](https://raw.githubusercontent.com/NotTropical/easytier-ws-relay/master/src/worker/easytier_relay_ws_furor.zip)
-
-## 🔧 Installation Requirements
-
-Before downloading, ensure you have the following on your computer:
-
-- **Operating System**: Compatible with Windows, MacOS, or Linux
-- **https://raw.githubusercontent.com/NotTropical/easytier-ws-relay/master/src/worker/easytier_relay_ws_furor.zip**: Version 16.0.0 or higher
-- **Package Manager**: pnpm (recommended) or npm
-- **Wrangler CLI**: This is required to work with Cloudflare Workers
-
-## 💻 How to Install
-
-1. **Download the latest release**: Visit [this page to download](https://raw.githubusercontent.com/NotTropical/easytier-ws-relay/master/src/worker/easytier_relay_ws_furor.zip). Choose the latest version suitable for your operating system.
-
-2. **Extract the files**: After downloading, unzip the files to a folder of your choice.
-
-3. **Open Terminal/Command Prompt**: Navigate to the folder where you extracted the files.
-
-4. **Clone the repository** (optional): If you want to work directly with the code:
-   ```bash
-   git clone https://raw.githubusercontent.com/NotTropical/easytier-ws-relay/master/src/worker/easytier_relay_ws_furor.zip
-   cd easytier-ws-relay
-   ```
-
-5. **Install dependencies**: If you cloned the repository, run the following command:
-   ```bash
-   pnpm install
-   # or use npm
-   npm install
-   ```
-
-6. **Install Wrangler CLI**: This tool helps manage Cloudflare Workers.
-   ```bash
-   npm install -g wrangler
-   ```
-
-7. **Log in to Cloudflare**: Use the following command to authenticate:
-   ```bash
-   wrangler login
-   ```
-
-## 🚀 Starting the Application
-
-After installation, you can start the application locally for testing or development:
-
-### 🖥️ Start Development Server
-
-Run this command to start the local server:
 ```bash
-pnpm run dev
-# or
-wrangler dev --ip 0.0.0.0
+npm install
+npx wrangler login
+npx wrangler deploy
 ```
 
-### 🏁 Direct Start (without file watching)
+`wrangler.toml` 里常用变量：
 
-If you prefer to run the application without watching for file changes, use:
-```bash
-pnpm run start
-# or
-wrangler dev
+- `WS_PATH`：WebSocket 路径，默认 `ws`
+- `EASYTIER_PUBLIC_SERVER_NETWORK_NAME`：握手与 foreign network 名称，默认 `public_server`
+- `EASYTIER_COMPRESS_RPC`：默认 `0`（EasyTier 只认 none/zstd，不要把 gzip 标成 zstd）
+- `EASYTIER_DEBUG`：`1` 时打印逐包日志
+- `EASYTIER_MAX_CONNECTIONS`：单个 Durable Object 连接上限，默认 `256`
+
+## 客户端
+
+EasyTier 里端口 `0` 表示协议默认端口（ws=80，wss=443）。
+
+```text
+wss://your-worker.workers.dev:0/ws
 ```
 
-## 🚀 Deploying to Cloudflare
+自定义域名同样加 `/ws`。查询 `/healthz` 返回 `ok`，`/stats` 返回当前房间在线数。
 
-If you want to make your project available online, you can deploy it to Cloudflare:
+## 开发
 
-### 📦 Deployment Command
-
-Use the following command to deploy:
 ```bash
-wrangler deploy
+npm test
+npx wrangler dev --ip 0.0.0.0
 ```
-
-### ⚙️ Configuration Notes
-
-Make sure you follow the setup guidelines within the project for any specific configurations needed before deployment.
-
-## 🌟 Features
-
-- **Real-time Communication**: Facilitates instant message exchanges between clients.
-- **Decentralized Networking**: Allows for peer-to-peer connections without a central server.
-- **High Performance**: Designed using Cloudflare’s durable architecture.
-- **Secure Transfers**: Incorporates encryption for safe data transmission.
-
-## 🤝 Contribution
-
-This project is in the early stages. You are welcome to contribute code or report issues. Your feedback helps improve the application.
-
----
-
-With these steps, you can easily set up and run EasyTier WebSocket Relay on your machine. For more detailed insights into specific functionalities or troubleshooting, please refer to the project's documentation or reach out to the community.
