@@ -1,5 +1,5 @@
 import { Buffer } from 'buffer';
-import { HEADER_SIZE } from './constants.js';
+import { HEADER_SIZE, MY_PEER_ID, PacketType } from './constants.js';
 
 export function bufferFromMessage(message) {
   if (message instanceof ArrayBuffer) {
@@ -88,4 +88,11 @@ export function buildForeignNetworkPayload(dstPeerId, networkName, innerPacket) 
   name.copy(payload, 10);
   innerPacket.copy(payload, headerLen);
   return payload;
+}
+
+export function wrapAsForeignNetwork(innerPacket, dstPeerId, networkName) {
+  const inner = Buffer.isBuffer(innerPacket) ? innerPacket : Buffer.from(innerPacket);
+  const payload = buildForeignNetworkPayload(dstPeerId, networkName, inner);
+  const header = createHeader(MY_PEER_ID, dstPeerId, PacketType.ForeignNetworkPacket, payload.length);
+  return Buffer.concat([header, payload]);
 }

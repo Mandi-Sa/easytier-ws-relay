@@ -5,6 +5,7 @@ import { wrapPacket, randomU64String } from './crypto.js';
 import { getPublicServerNetworkName } from './env.js';
 import { sendWs } from './env.js';
 import { RpcPieceMerger } from './rpc_pieces.js';
+import { parseConnBitmapEdges, parseConnPeerList, edgesFromConnPeerList, buildStarAndReportedBitmap } from './topology.js';
 
 const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
 
@@ -88,20 +89,45 @@ export class PeerManager {
     this.syncFailures = 0;
     this.forwardDrops = 0;
     this.forwardOk = 0;
+    this.onTopologyChange = null;
+    this.reportedConns = new Map();
+    this.lastSyncByPeer = new Map();
+    this.storage = null;
   }
 
   async hydrateIdentity(storage) {
+    this.storage = storage || null;
     if (!storage || typeof storage.get !== 'function') return;
     const instId = await storage.get('relayInstId');
     const peerRouteId = await storage.get('relayPeerRouteId');
     if (instId) this.storedInstId = instId;
     if (peerRouteId !== undefined && peerRouteId !== null) this.storedPeerRouteId = peerRouteId;
+    const savedVersions = await storage.get('connVersions');
+    if (savedVersions && typeof savedVersions === 'object') {
+      for (const [gk, mapObj] of Object.entries(savedVersions)) {
+        const m = this._getPeerConnVersionMap(gk, true);
+        for (const [pid, ver] of Object.entries(mapObj || {})) {
+          m.set(Number(pid), Number(ver) || 0);
+        }
+      }
+    }
     const my = this.ensureMyInfo();
     if (typeof storage.put !== 'function') return;
     if (!instId) await storage.put('relayInstId', my.instId);
     if (peerRouteId === undefined || peerRouteId === null) {
       await storage.put('relayPeerRouteId', my.peerRouteId);
     }
+  }
+
+  async persistConnVersions() {
+    if (!this.storage || typeof this.storage.put !== 'function') return;
+    const out = {};
+    for (const [gk, m] of this.peerConnVersions.entries()) {
+      out[gk] = Object.fromEntries(m.entries());
+    }
+    try {
+      await this.storage.put('connVersions', out);
+    } catch (_) { }
   }
 
   setTypes(types) {
@@ -118,8 +144,10 @@ export class PeerManager {
       featureFlag: {
         isPublicServer: true,
         avoidRelayData: this.pureP2PMode,
-        kcpInput: false,
-        noRelayKcp: false
+        kcpInput: true,
+        noRelayKcp: false,
+        quicInput: true,
+        supportConnListSync: true,
       },
       networkLength: Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
       easytierVersion: process.env.EASYTIER_VERSION || "cf-ws-relay",
@@ -183,8 +211,9 @@ export class PeerManager {
   bumpPeerConnVersion(groupKey, peerId) {
     const m = this._getPeerConnVersionMap(groupKey, true);
     const current = m.get(peerId) || 0;
-    const next = current + 1;
+    const next = Math.max(current + 1, Math.floor(Date.now() / 1000));
     m.set(peerId, next);
+    this.persistConnVersions();
     return next;
   }
 
@@ -205,6 +234,84 @@ export class PeerManager {
     for (const pid of allPeers) {
       this.bumpPeerConnVersion(groupKey, pid);
     }
+  }
+
+  _getReportedConns(groupKey, create = false) {
+    const k = String(groupKey || '');
+    let m = this.reportedConns.get(k);
+    if (!m && create) {
+      m = new Map();
+      this.reportedConns.set(k, m);
+    }
+    return m;
+  }
+
+  ingestReportedEdges(groupKey, fromPeerId, edges) {
+    const m = this._getReportedConns(groupKey, true);
+    const connected = new Set();
+    for (const [a, b] of edges || []) {
+      const other = Number(a) === Number(fromPeerId) ? Number(b) : Number(b) === Number(fromPeerId) ? Number(a) : null;
+      if (other == null || other === Number(fromPeerId) || other === MY_PEER_ID) continue;
+      connected.add(other);
+    }
+    const prev = m.get(Number(fromPeerId));
+    const prevKey = prev ? Array.from(prev).sort().join(',') : '';
+    const nextKey = Array.from(connected).sort().join(',');
+    m.set(Number(fromPeerId), connected);
+    if (prevKey !== nextKey) {
+      this.bumpPeerConnVersion(groupKey, fromPeerId);
+      this.bumpPeerConnVersion(groupKey, MY_PEER_ID);
+    }
+  }
+
+  ingestConnInfo(groupKey, fromPeerId, syncReq, rawSyncBytes) {
+    const edges = [];
+    if (syncReq && syncReq.connBitmap) {
+      edges.push(...parseConnBitmapEdges(syncReq.connBitmap, fromPeerId));
+    }
+    if (rawSyncBytes) {
+      const list = parseConnPeerList(rawSyncBytes);
+      edges.push(...edgesFromConnPeerList(list, fromPeerId));
+    }
+    this.ingestReportedEdges(groupKey, fromPeerId, edges);
+    this.notePeerSync(fromPeerId);
+  }
+
+  collectReportedEdges(groupKey) {
+    const live = new Set(this.listPeerIdsInGroup(groupKey).map(Number));
+    live.add(MY_PEER_ID);
+    const edges = [];
+    const m = this._getReportedConns(groupKey, false);
+    if (!m) return edges;
+    for (const [src, dsts] of m.entries()) {
+      if (!live.has(Number(src))) continue;
+      for (const dst of dsts) {
+        if (!live.has(Number(dst))) continue;
+        edges.push([Number(src), Number(dst)]);
+      }
+    }
+    return edges;
+  }
+
+  notePeerSync(peerId) {
+    this.lastSyncByPeer.set(Number(peerId), Date.now());
+  }
+
+  routeIdKey(routeId) {
+    if (routeId == null) return '';
+    if (typeof routeId === 'object') {
+      return `${routeId.part1 || 0}:${routeId.part2 || 0}:${routeId.part3 || 0}:${routeId.part4 || 0}`;
+    }
+    return String(routeId);
+  }
+
+  isDuplicatePeerId(groupKey, fromPeerId, info) {
+    if (!info || Number(info.peerId) !== Number(fromPeerId)) return false;
+    const existing = this._getPeerInfosMap(groupKey, false)?.get(fromPeerId);
+    if (!existing || existing.peerRouteId == null || info.peerRouteId == null) return false;
+    const a = this.routeIdKey(existing.peerRouteId);
+    const b = this.routeIdKey(info.peerRouteId);
+    return !!(a && b && a !== b);
   }
 
   setPublicServerFlag(isPublicServer) {
@@ -360,6 +467,9 @@ export class PeerManager {
       this.instIdByGroup.delete(groupKey);
     }
     this._clearInstId(groupKey, peerId);
+    const reported = this._getReportedConns(groupKey, false);
+    if (reported) reported.delete(Number(peerId));
+    this.lastSyncByPeer.delete(Number(peerId));
     return true;
   }
 
@@ -403,6 +513,9 @@ export class PeerManager {
         oldWs.replacedByNewConnection = true;
         oldWs.peerId = null;
         try { oldWs.close(1000, 'replaced-inst'); } catch (_) { }
+      }
+      if (typeof this.onTopologyChange === 'function') {
+        try { this.onTopologyChange(groupKey); } catch (_) { }
       }
     }
     m.set(key, peerId);
@@ -453,6 +566,7 @@ export class PeerManager {
       forwardDrops: this.forwardDrops,
       forwardOk: this.forwardOk,
       peerIds: this.listAllPeerIds(),
+      lastSync: Object.fromEntries(this.lastSyncByPeer.entries()),
     };
   }
 
@@ -619,38 +733,16 @@ export class PeerManager {
     if (relevantPeers.length > 0) {
       const connVersions = this._getPeerConnVersionMap(groupKey, true);
       const peerIdVersions = relevantPeers.map((pid) => {
-        const existing = connVersions.get(pid) || 1;
+        const existing = connVersions.get(pid) || Math.floor(Date.now() / 1000);
         return { peerId: pid, version: existing };
       });
       const N = peerIdVersions.length;
-      const bitmapSize = Math.ceil((N * N) / 8);
-      const bitmap = new Uint8Array(bitmapSize);
-      const idxByPeerId = new Map();
-      for (let i = 0; i < peerIdVersions.length; i++) {
-        idxByPeerId.set(peerIdVersions[i].peerId, i);
-      }
-      const setBit = (row, col) => {
-        const idx = row * N + col;
-        bitmap[Math.floor(idx / 8)] |= (1 << (idx % 8));
-      };
-      for (let i = 0; i < peerIdVersions.length; i++) {
-        setBit(i, i);
-      }
-      const serverIdx = idxByPeerId.get(MY_PEER_ID);
-      if (serverIdx !== undefined) {
-        for (let i = 0; i < peerIdVersions.length; i++) {
-          if (i === serverIdx) continue;
-          setBit(serverIdx, i);
-          setBit(i, serverIdx);
-        }
-      } else {
-        for (let i = 0; i < peerIdVersions.length; i++) {
-          for (let j = 0; j < peerIdVersions.length; j++) {
-            setBit(i, j);
-          }
-        }
-      }
-      const bitmapBuf = Buffer.from(bitmap);
+      const reported = this.collectReportedEdges(groupKey);
+      const bitmapBuf = buildStarAndReportedBitmap(
+        peerIdVersions.map((p) => p.peerId),
+        reported,
+        MY_PEER_ID,
+      );
       const sig = `${peerIdVersions.map(p => `${p.peerId}:${p.version}`).join(',')}|${bitmapBuf.toString('hex')}`;
       const connVersion = session.connBitmapVerMap.get(targetPeerId) || 0;
       const nextConnVersion = connVersion || Math.max(...peerIdVersions.map(p => p.version));
@@ -721,7 +813,7 @@ export class PeerManager {
       totalPieces: 1,
       pieceIdx: 0,
       traceId: 0,
-      compressionInfo: { algo: 1, acceptedAlgo: 1 }
+      compressionInfo: { algo: 1, acceptedAlgo: 2 }
     };
 
     const rpcPacketBytes = t.RpcPacket.encode(rpcReqPacket).finish();

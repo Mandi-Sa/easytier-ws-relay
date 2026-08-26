@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import zlib from 'zlib';
 import { readFileSync } from 'node:fs';
 import { PeerManager } from '../src/worker/core/peer_manager.js';
-import { parseHeader, createHeader, bufferFromMessage, splitPackets, parseForeignNetworkPayload, buildForeignNetworkPayload } from '../src/worker/core/packet.js';
+import { parseHeader, createHeader, bufferFromMessage, splitPackets, parseForeignNetworkPayload, buildForeignNetworkPayload, wrapAsForeignNetwork } from '../src/worker/core/packet.js';
 import { MY_PEER_ID, HEADER_SIZE, PacketType } from '../src/worker/core/constants.js';
 import { handleForwarding } from '../src/worker/core/basic_handlers.js';
 import { RpcPieceMerger } from '../src/worker/core/rpc_pieces.js';
@@ -194,6 +194,49 @@ test('foreign network packet to the relay is unwrapped and forwarded', () => {
   const ok = handleForwarding(src, header, outer, null, pm);
   assert.equal(ok, true);
   assert.equal(sent.length, 1);
-  assert.equal(Buffer.compare(sent[0], inner), 0);
+  const forwarded = parseHeader(sent[0]);
+  assert.equal(forwarded.packetType, PacketType.ForeignNetworkPacket);
+  assert.equal(forwarded.toPeerId, 222);
+  assert.equal(forwarded.fromPeerId, MY_PEER_ID);
+  const wrapped = parseForeignNetworkPayload(sent[0].subarray(16));
+  assert.equal(wrapped.dstPeerId, 222);
+  assert.equal(Buffer.compare(wrapped.inner, inner), 0);
   assert.equal(pm.getStats().forwardOk, 1);
+});
+
+test('inst_id replacement notifies topology listeners', () => {
+  const pm = new PeerManager();
+  const events = [];
+  pm.onTopologyChange = (gk) => events.push(gk);
+  const id = { part1: 1, part2: 2, part3: 3, part4: 4 };
+  pm.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() { this.readyState = 3; } });
+  pm.updatePeerInfo('g', 111, { peerId: 111, version: 1, instId: id });
+  pm.addPeer(222, { peerId: 222, groupKey: 'g', readyState: 1, close() { this.readyState = 3; } });
+  pm.updatePeerInfo('g', 222, { peerId: 222, version: 2, instId: id });
+  assert.equal(pm.getPeerWs(111, 'g'), undefined);
+  assert.ok(events.includes('g'));
+});
+
+test('conn bitmap versions jump forward after a restart', () => {
+  const pm = new PeerManager();
+  pm.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() {} });
+  const v = pm.bumpPeerConnVersion('g', 111);
+  assert.ok(v >= Math.floor(Date.now() / 1000) - 1);
+});
+
+test('reported direct edges are merged into the star bitmap', () => {
+  const pm = new PeerManager();
+  pm.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() {} });
+  pm.addPeer(222, { peerId: 222, groupKey: 'g', readyState: 1, close() {} });
+  pm.ingestReportedEdges('g', 111, [[111, 222]]);
+  const edges = pm.collectReportedEdges('g');
+  assert.deepEqual(edges, [[111, 222]]);
+});
+
+test('duplicate peer_route_id from the same peer is detected', () => {
+  const pm = new PeerManager();
+  pm.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() {} });
+  pm.updatePeerInfo('g', 111, { peerId: 111, version: 1, peerRouteId: '1' });
+  assert.equal(pm.isDuplicatePeerId('g', 111, { peerId: 111, peerRouteId: '2' }), true);
+  assert.equal(pm.isDuplicatePeerId('g', 111, { peerId: 111, peerRouteId: '1' }), false);
 });

@@ -1,7 +1,7 @@
 import { Buffer } from 'buffer';
 import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
-import { createHeader, parseForeignNetworkPayload } from './packet.js';
-import { wrapPacket, randomU64String } from './crypto.js';
+import { createHeader, parseForeignNetworkPayload, wrapAsForeignNetwork } from './packet.js';
+import { wrapPacket, randomU64String, deriveKeys } from './crypto.js';
 import { getPublicServerNetworkName, persistSocketMeta, debugLog, sendWs } from './env.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
@@ -50,7 +50,14 @@ export function handleHandshake(ws, header, payload, types, peerManager) {
     ws.peerId = req.myPeerId;
     peerManager.addPeer(req.myPeerId, ws);
     peerManager.setPublicServerFlag(true);
-    ws.crypto = { enabled: false };
+    const features = req.features || [];
+    const wantCrypto = features.some((f) => /aes|encrypt|gcm/i.test(String(f)));
+    if (wantCrypto) {
+      const keys = deriveKeys('');
+      ws.crypto = { enabled: true, algorithm: 'aes-gcm', key128: keys.key128, key256: keys.key256 };
+    } else {
+      ws.crypto = { enabled: false };
+    }
 
     const respBuffer = types.HandshakeRequest.encode(respPayload).finish();
     const respHeader = createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length);
@@ -102,7 +109,8 @@ export function handleForwarding(sourceWs, header, fullMessage, types, peerManag
       return false;
     }
     targetPeerId = foreign.dstPeerId;
-    body = foreign.inner;
+    const networkName = foreign.networkName || (sourceWs && sourceWs.domainName) || getPublicServerNetworkName();
+    body = wrapAsForeignNetwork(foreign.inner, targetPeerId, networkName);
   } else if (targetPeerId === MY_PEER_ID) {
     return false;
   }

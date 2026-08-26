@@ -33,10 +33,11 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
     return;
   }
   const compressEnabled = process.env.EASYTIER_COMPRESS_RPC !== '0';
+  const accepted = reqRpcPacket && reqRpcPacket.compressionInfo && reqRpcPacket.compressionInfo.acceptedAlgo;
   let responseBody = responseBodyBytes;
-  let compressionInfo = { algo: 1, acceptedAlgo: 1 };
+  let compressionInfo = { algo: 1, acceptedAlgo: 2 };
   if (compressEnabled && responseBodyBytes && responseBodyBytes.length > 256) {
-    const negotiated = negotiateRpcCompression(responseBodyBytes);
+    const negotiated = negotiateRpcCompression(responseBodyBytes, accepted);
     responseBody = negotiated.body;
     compressionInfo = negotiated.compressionInfo;
   }
@@ -157,13 +158,28 @@ export function handleRpcReq(ws, header, payload, types, peerManager) {
       return;
     }
 
+    if ((descriptor.serviceName === 'peer_rpc.DirectConnectorRpc' || descriptor.serviceName === 'DirectConnectorRpc')
+      && (descriptor.protoName === 'peer_rpc' || !descriptor.protoName)) {
+      if (descriptor.methodIndex === 0 && types.GetIpListResponse) {
+        const respBytes = types.GetIpListResponse.encode({
+          publicIpv4: null,
+          interfaceIpv4s: [],
+          publicIpv6: null,
+          interfaceIpv6s: [],
+          listeners: [],
+        }).finish();
+        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
+        return;
+      }
+    }
+
     if ((descriptor.serviceName === 'peer_rpc.OspfRouteRpc' || descriptor.serviceName === 'OspfRouteRpc')
       && (descriptor.protoName === 'peer_rpc' || descriptor.protoName === 'peer_rpc.OspfRouteRpc' || descriptor.protoName === 'OspfRouteRpc' || !descriptor.protoName)) {
       const req = types.SyncRouteInfoRequest.decode(innerReqBody);
       const fromPeerId = header.fromPeerId;
       debugLog(`SyncRouteInfo from ${fromPeerId} session=${req.mySessionId} initiator=${req.isInitiator}`);
       if (descriptor.methodIndex === 0 || descriptor.methodIndex === 1) {
-        handleSyncRouteInfo(ws, fromPeerId, rpcPacket, req, types, peerManager);
+        handleSyncRouteInfo(ws, fromPeerId, rpcPacket, req, types, peerManager, innerReqBody);
         return;
       }
       debugLog(`Unhandled OspfRouteRpc methodIndex=${descriptor.methodIndex}`);
@@ -222,7 +238,7 @@ export function handleRpcResp(ws, header, payload, types, peerManager) {
   }
 }
 
-function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, peerManager) {
+function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, peerManager, rawSyncBytes) {
   const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
 
   if (!ws.serverSessionId) {
@@ -234,18 +250,36 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, peerM
   }
   peerManager.onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
 
-  let hasNewPeers = false;
+  let duplicate = false;
+  if (syncReq.peerInfos && syncReq.peerInfos.items) {
+    for (const info of syncReq.peerInfos.items) {
+      if (peerManager.isDuplicatePeerId(groupKey, fromPeerId, info)) {
+        duplicate = true;
+        break;
+      }
+    }
+  }
+
+  if (duplicate) {
+    const respBytes = types.SyncRouteInfoResponse.encode({
+      isInitiator: !syncReq.isInitiator,
+      sessionId: ws.serverSessionId,
+      error: 0,
+    }).finish();
+    sendRpcResponse(ws, fromPeerId, reqRpcPacket, types, respBytes);
+    return;
+  }
+
   if (syncReq.peerInfos && syncReq.peerInfos.items) {
     syncReq.peerInfos.items.forEach(info => {
       if (!peerManager.shouldAcceptPeerInfo(groupKey, info.peerId, fromPeerId)) {
         return;
       }
-      const infos = peerManager._getPeerInfosMap(groupKey, false);
-      const isNew = !infos || !infos.has(info.peerId);
       peerManager.updatePeerInfo(groupKey, info.peerId, info);
-      if (isNew) hasNewPeers = true;
     });
   }
+
+  peerManager.ingestConnInfo(groupKey, fromPeerId, syncReq, rawSyncBytes);
 
   const respPayload = {
     isInitiator: !syncReq.isInitiator,
@@ -254,8 +288,6 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, peerM
   const respBytes = types.SyncRouteInfoResponse.encode(respPayload).finish();
   sendRpcResponse(ws, fromPeerId, reqRpcPacket, types, respBytes);
 
-  peerManager.pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: true });
-  if (hasNewPeers) {
-    peerManager.broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: true });
-  }
+  peerManager.pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: false });
+  peerManager.broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: false });
 }

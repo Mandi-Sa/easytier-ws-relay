@@ -4,7 +4,7 @@ import { loadProtos } from './core/protos.js';
 import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
 import { PeerManager } from './core/peer_manager.js';
-import { randomU64String } from './core/crypto.js';
+import { randomU64String, maybeDecryptIncoming } from './core/crypto.js';
 import {
   applyWorkerEnv,
   getWsPath,
@@ -22,6 +22,13 @@ export class RelayRoom {
     this.types = loadProtos();
     this.peerManager = new PeerManager();
     this.peerManager.setTypes(this.types);
+    this.peerManager.onTopologyChange = (groupKey) => {
+      try {
+        this.peerManager.broadcastRouteUpdate(this.types, groupKey, undefined, { forceFull: true });
+      } catch (e) {
+        console.error('topology broadcast failed:', e);
+      }
+    };
     if (env && env.EASYTIER_DISABLE_RELAY !== undefined) {
       this.peerManager.setPureP2PMode(env.EASYTIER_DISABLE_RELAY === '1');
     }
@@ -72,9 +79,14 @@ export class RelayRoom {
   async webSocketMessage(ws, message) {
     await this.ready;
     try {
-      const buffer = bufferFromMessage(message);
-      if (!buffer) {
+      const buffer0 = bufferFromMessage(message);
+      if (!buffer0) {
         console.warn('[ws] unsupported message type', typeof message);
+        return;
+      }
+      const buffer = maybeDecryptIncoming(buffer0, ws);
+      if (!buffer) {
+        debugLog('[ws] decrypt failed');
         return;
       }
       debugLog(`[ws] recv len=${buffer.length}`);

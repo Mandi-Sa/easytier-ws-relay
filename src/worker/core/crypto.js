@@ -214,3 +214,29 @@ export function wrapPacket(createHeader, fromPeerId, toPeerId, packetType, paylo
 
   return Buffer.concat([headerBuf, body]);
 }
+
+export function maybeDecryptIncoming(buffer, ws) {
+  if (!buffer || buffer.length < 16) return buffer;
+  const flags = buffer[9];
+  if (!(flags & 1)) return buffer;
+  const body = buffer.subarray(16);
+  const keys = (ws && ws.crypto && (ws.crypto.key128 || ws.crypto.key256))
+    ? ws.crypto
+    : { ...deriveKeys(''), algorithm: 'aes-gcm' };
+  const tryKeys = [];
+  if (keys.key128) tryKeys.push(['aes-gcm', keys.key128]);
+  if (keys.key256) tryKeys.push(['aes-256-gcm', keys.key256]);
+  for (const [algo, key] of tryKeys) {
+    try {
+      const plain = decryptAesGcm(body, key);
+      const out = Buffer.concat([buffer.subarray(0, 16), plain]);
+      out.writeUInt8(flags & ~1, 9);
+      out.writeUInt32LE(plain.length, 12);
+      if (ws) {
+        ws.crypto = { enabled: true, algorithm: algo, key128: keys.key128, key256: keys.key256 };
+      }
+      return out;
+    } catch (_) { }
+  }
+  return null;
+}

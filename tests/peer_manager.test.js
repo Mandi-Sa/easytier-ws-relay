@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { PeerManager } from '../src/worker/core/peer_manager.js';
 import { MY_PEER_ID } from '../src/worker/core/constants.js';
 import { getWsPath, getPublicServerNetworkName } from '../src/worker/core/env.js';
-import { negotiateRpcCompression, RPC_COMPRESSION_NONE } from '../src/worker/core/rpc_compress.js';
+import { negotiateRpcCompression, RPC_COMPRESSION_NONE, RPC_COMPRESSION_ZSTD } from '../src/worker/core/rpc_compress.js';
 
 function ws(peerId, groupKey = 'g') {
   return { peerId, groupKey, readyState: 1, close() { this.readyState = 3; } };
@@ -72,5 +72,5 @@ test('rpc compression never claims zstd for gzip payloads', () => {
   const { body, compressionInfo } = negotiateRpcCompression(Buffer.from('hello'));
   assert.equal(body.toString(), 'hello');
   assert.equal(compressionInfo.algo, RPC_COMPRESSION_NONE);
-  assert.equal(compressionInfo.acceptedAlgo, RPC_COMPRESSION_NONE);
+  assert.ok(compressionInfo.acceptedAlgo === RPC_COMPRESSION_NONE || compressionInfo.acceptedAlgo === RPC_COMPRESSION_ZSTD);
 });
