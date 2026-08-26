@@ -43,6 +43,25 @@ export class RelayRoom {
     }
     // EasyTier Ping payloads vary, so WebSocket auto-response cannot match them.
     this.state.getWebSockets().forEach((ws) => this._restoreSocket(ws));
+    try {
+      await this.state.storage.setAlarm(Date.now() + 10_000);
+    } catch (e) {
+      console.error('setAlarm failed:', e);
+    }
+  }
+
+  async alarm() {
+    await this.ready;
+    try {
+      this.peerManager.broadcastRouteUpdate(this.types, undefined, undefined, { forceFull: false });
+    } catch (e) {
+      console.error('alarm broadcast failed:', e);
+    }
+    try {
+      await this.state.storage.setAlarm(Date.now() + 15_000);
+    } catch (e) {
+      console.error('setAlarm failed:', e);
+    }
   }
 
   async fetch(request) {
@@ -157,7 +176,7 @@ export class RelayRoom {
     ws.domainName = meta.domainName || null;
     ws.lastSeen = Date.now();
     ws.serverSessionId = meta.serverSessionId || randomU64String();
-    ws.weAreInitiator = false;
+    ws.weAreInitiator = true;
     ws.crypto = { enabled: false };
     persistSocketMeta(ws);
   }

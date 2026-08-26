@@ -15,7 +15,7 @@ npx wrangler deploy
 
 - `WS_PATH`：WebSocket 路径，默认 `ws`
 - `EASYTIER_PUBLIC_SERVER_NETWORK_NAME`：握手与 foreign network 名称，默认 `public_server`
-- `EASYTIER_COMPRESS_RPC`：默认 `0`（EasyTier 只认 none/zstd，不要把 gzip 标成 zstd）
+- `EASYTIER_COMPRESS_RPC`：默认 `1`（按对端 `acceptedAlgo` 协商 none/zstd，不会把 gzip 标成 zstd）
 - `EASYTIER_DEBUG`：`1` 时打印逐包日志
 - `EASYTIER_MAX_CONNECTIONS`：单个 Durable Object 连接上限，默认 `256`
 

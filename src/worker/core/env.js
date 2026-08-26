@@ -35,6 +35,28 @@ export function getPublicServerNetworkName() {
   return process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'public_server';
 }
 
+export function handshakeDigestBytes(raw) {
+  const out = Buffer.alloc(32);
+  if (!raw) return out;
+  const src = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+  if (src.length === 0) return out;
+  src.copy(out, 0, 0, Math.min(32, src.length));
+  return out;
+}
+
+export function digestBytesFromGroupKey(groupKey) {
+  const s = String(groupKey || '');
+  const idx = s.lastIndexOf(':');
+  if (idx < 0) return Buffer.alloc(32);
+  const hex = s.slice(idx + 1);
+  if (!hex) return Buffer.alloc(32);
+  try {
+    return handshakeDigestBytes(Buffer.from(hex, 'hex'));
+  } catch (_) {
+    return Buffer.alloc(32);
+  }
+}
+
 export function persistSocketMeta(ws) {
   if (!ws || typeof ws.serializeAttachment !== 'function') return;
   ws.serializeAttachment({
@@ -42,6 +64,7 @@ export function persistSocketMeta(ws) {
     groupKey: ws.groupKey || null,
     domainName: ws.domainName || null,
     serverSessionId: ws.serverSessionId || null,
+    weAreInitiator: true,
   });
 }
 

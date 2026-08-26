@@ -5,6 +5,53 @@ import { decompressRpcBody } from './compress.js';
 import { negotiateRpcCompression } from './rpc_compress.js';
 import { debugLog, sendWs, getPublicServerNetworkName } from './env.js';
 
+function isPeerCenterService(descriptor) {
+  const name = descriptor && descriptor.serviceName;
+  const proto = descriptor && descriptor.protoName;
+  return (name === 'peer_rpc.PeerCenterRpc' || name === 'PeerCenterRpc')
+    && (proto === 'peer_rpc' || !proto);
+}
+
+function ingestPeerCenterReport(ws, types, peerManager, innerReqBody) {
+  const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
+  const req = types.ReportPeersRequest.decode(innerReqBody);
+  const myPeerId = req.myPeerId;
+  const peers = req.peerInfos || req.peer_infos || { directPeers: {} };
+  const rawDirect = (peers && (peers.directPeers || peers.direct_peers)) || {};
+
+  const directPeers = {};
+  for (const [dstPeerId, info] of Object.entries(rawDirect)) {
+    directPeers[String(dstPeerId)] = { latencyMs: (info && typeof info.latencyMs === 'number') ? info.latencyMs : 0 };
+  }
+  const state = peerManager.getPeerCenterState(groupKey);
+  state.globalPeerMap.set(String(myPeerId), { directPeers, lastSeen: Date.now() });
+  const edges = Object.keys(directPeers).map((dst) => [Number(myPeerId), Number(dst)]);
+  peerManager.ingestPeerCenterEdges(groupKey, myPeerId, edges);
+  const snapshot = peerManager.buildPeerCenterResponseMap(groupKey);
+  state.digest = calcPeerCenterDigestFromMap(snapshot);
+  return { myPeerId, directPeers };
+}
+
+export function sniffPeerCenterReport(ws, header, payload, types, peerManager) {
+  if (!types || !peerManager || !payload) return false;
+  try {
+    const rpcPacket = types.RpcPacket.decode(payload);
+    const descriptor = rpcPacket.descriptor || {};
+    if (!isPeerCenterService(descriptor) || Number(descriptor.methodIndex) !== 0) return false;
+    let innerReqBody = rpcPacket.body;
+    try {
+      const rpcReqWrapper = types.RpcRequest.decode(rpcPacket.body);
+      if (rpcReqWrapper.request && rpcReqWrapper.request.length > 0) {
+        innerReqBody = rpcReqWrapper.request;
+      }
+    } catch (_) { }
+    ingestPeerCenterReport(ws, types, peerManager, innerReqBody);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function calcPeerCenterDigestFromMap(mapObj) {
   const h = sha256();
   const keys = Object.keys(mapObj).sort();
@@ -110,50 +157,35 @@ export function handleRpcReq(ws, header, payload, types, peerManager) {
       debugLog('Failed to decode RpcRequest wrapper, assuming raw body:', e.message);
     }
 
-    if ((descriptor.serviceName === 'peer_rpc.PeerCenterRpc' || descriptor.serviceName === 'PeerCenterRpc')
-      && (descriptor.protoName === 'peer_rpc' || !descriptor.protoName)) {
+    if (isPeerCenterService(descriptor) && descriptor.methodIndex === 0) {
+      ingestPeerCenterReport(ws, types, peerManager, innerReqBody);
+      const respBytes = types.ReportPeersResponse.encode({}).finish();
+      sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
+      return;
+    }
+
+    if (isPeerCenterService(descriptor) && descriptor.methodIndex === 1) {
       const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
       const state = peerManager.getPeerCenterState(groupKey);
-      if (descriptor.methodIndex === 0) {
-        const req = types.ReportPeersRequest.decode(innerReqBody);
-        const myPeerId = req.myPeerId;
-        const peers = req.peerInfos || { directPeers: {} };
-
-        const directPeers = {};
-        if (peers.directPeers) {
-          for (const [dstPeerId, info] of Object.entries(peers.directPeers)) {
-            directPeers[String(dstPeerId)] = { latencyMs: (info && typeof info.latencyMs === 'number') ? info.latencyMs : 0 };
-          }
-        }
-        state.globalPeerMap.set(String(myPeerId), { directPeers, lastSeen: Date.now() });
-
-        const snapshot = peerManager.buildPeerCenterResponseMap(groupKey);
-        state.digest = calcPeerCenterDigestFromMap(snapshot);
-
-        const respBytes = types.ReportPeersResponse.encode({}).finish();
+      const req = types.GetGlobalPeerMapRequest.decode(innerReqBody);
+      const reqDigest = req.digest !== undefined && req.digest !== null ? String(req.digest) : '0';
+      if (reqDigest === state.digest && reqDigest !== '0') {
+        const respBytes = types.GetGlobalPeerMapResponse.encode({}).finish();
         sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
         return;
       }
 
-      if (descriptor.methodIndex === 1) {
-        const req = types.GetGlobalPeerMapRequest.decode(innerReqBody);
-        const reqDigest = req.digest !== undefined && req.digest !== null ? String(req.digest) : '0';
-        if (reqDigest === state.digest && reqDigest !== '0') {
-          const respBytes = types.GetGlobalPeerMapResponse.encode({}).finish();
-          sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
-          return;
-        }
+      const snapshot = peerManager.buildPeerCenterResponseMap(groupKey);
+      state.digest = calcPeerCenterDigestFromMap(snapshot);
+      const respBytes = types.GetGlobalPeerMapResponse.encode({
+        globalPeerMap: snapshot,
+        digest: state.digest,
+      }).finish();
+      sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
+      return;
+    }
 
-        const snapshot = peerManager.buildPeerCenterResponseMap(groupKey);
-        state.digest = calcPeerCenterDigestFromMap(snapshot);
-        const respBytes = types.GetGlobalPeerMapResponse.encode({
-          globalPeerMap: snapshot,
-          digest: state.digest,
-        }).finish();
-        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
-        return;
-      }
-
+    if (isPeerCenterService(descriptor)) {
       debugLog(`Unhandled PeerCenterRpc methodIndex=${descriptor.methodIndex}`);
       return;
     }
@@ -245,10 +277,8 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types, peerM
     ws.serverSessionId = randomU64String();
   }
 
-  if (syncReq && typeof syncReq.isInitiator === 'boolean') {
-    ws.weAreInitiator = !syncReq.isInitiator;
-  }
-  peerManager.onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
+  ws.weAreInitiator = true;
+  peerManager.onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, true);
 
   let duplicate = false;
   if (syncReq.peerInfos && syncReq.peerInfos.items) {

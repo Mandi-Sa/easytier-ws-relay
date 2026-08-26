@@ -233,6 +233,51 @@ test('reported direct edges are merged into the star bitmap', () => {
   assert.deepEqual(edges, [[111, 222]]);
 });
 
+test('ospf star bitmap does not wipe peer-center p2p edges', () => {
+  const pm = new PeerManager();
+  pm.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() {} });
+  pm.addPeer(222, { peerId: 222, groupKey: 'g', readyState: 1, close() {} });
+  pm.ingestPeerCenterEdges('g', 111, [[111, 222]]);
+  pm.ingestConnInfo('g', 111, {
+    connBitmap: {
+      peerIds: [{ peerId: MY_PEER_ID }, { peerId: 111 }, { peerId: 222 }],
+      bitmap: Buffer.from([0xff]),
+    },
+  }, null);
+  const edges = pm.collectReportedEdges('g');
+  assert.ok(edges.some(([a, b]) => a === 111 && b === 222));
+});
+
+test('empty peer-center report does not clear existing p2p edges', () => {
+  const pm = new PeerManager();
+  pm.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() {} });
+  pm.addPeer(222, { peerId: 222, groupKey: 'g', readyState: 1, close() {} });
+  pm.ingestPeerCenterEdges('g', 111, [[111, 222]]);
+  pm.ingestPeerCenterEdges('g', 111, []);
+  const edges = pm.collectReportedEdges('g');
+  assert.ok(edges.some(([a, b]) => a === 111 && b === 222));
+});
+
+test('topology edges survive storage roundtrip', async () => {
+  const store = new Map();
+  const storage = {
+    async get(k) { return store.get(k); },
+    async put(k, v) { store.set(k, v); },
+  };
+  const pm = new PeerManager();
+  pm.storage = storage;
+  pm.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() {} });
+  pm.addPeer(222, { peerId: 222, groupKey: 'g', readyState: 1, close() {} });
+  pm.ingestOspfEdges('g', 111, [[111, 222]]);
+  await pm.persistTopology();
+  const pm2 = new PeerManager();
+  await pm2.hydrateIdentity(storage);
+  pm2.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() {} });
+  pm2.addPeer(222, { peerId: 222, groupKey: 'g', readyState: 1, close() {} });
+  const edges = pm2.collectReportedEdges('g');
+  assert.ok(edges.some(([a, b]) => a === 111 && b === 222));
+});
+
 test('duplicate peer_route_id from the same peer is detected', () => {
   const pm = new PeerManager();
   pm.addPeer(111, { peerId: 111, groupKey: 'g', readyState: 1, close() {} });

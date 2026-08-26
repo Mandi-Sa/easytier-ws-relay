@@ -1,8 +1,9 @@
 import { Buffer } from 'buffer';
 import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
-import { createHeader, parseForeignNetworkPayload, wrapAsForeignNetwork } from './packet.js';
+import { createHeader, parseForeignNetworkPayload, wrapAsForeignNetwork, parseHeader } from './packet.js';
 import { wrapPacket, randomU64String, deriveKeys } from './crypto.js';
-import { getPublicServerNetworkName, persistSocketMeta, debugLog, sendWs } from './env.js';
+import { getPublicServerNetworkName, persistSocketMeta, debugLog, sendWs, handshakeDigestBytes } from './env.js';
+import { sniffPeerCenterReport } from './rpc_handler.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
 
@@ -33,7 +34,8 @@ export function handleHandshake(ws, header, payload, types, peerManager) {
       return;
     }
     const serverNetworkName = getPublicServerNetworkName();
-    const digest = new Uint8Array(32);
+    const digest = handshakeDigestBytes(clientDigest);
+    ws.networkDigest = digest;
 
     ws.domainName = clientNetworkName;
 
@@ -68,20 +70,14 @@ export function handleHandshake(ws, header, payload, types, peerManager) {
       ws.serverSessionId = randomU64String();
     }
     persistSocketMeta(ws);
-    if (ws.weAreInitiator === undefined) {
-      ws.weAreInitiator = false;
-    }
+    ws.weAreInitiator = true;
 
-    setTimeout(() => {
-      try {
-        if (ws.readyState === WS_OPEN) {
-          peerManager.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
-          peerManager.broadcastRouteUpdate(types, ws.groupKey, req.myPeerId, { forceFull: true });
-        }
-      } catch (e) {
-        console.error(`Failed to push initial route update to ${req.myPeerId}:`, e.message);
-      }
-    }, 50);
+    try {
+      peerManager.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
+      peerManager.broadcastRouteUpdate(types, ws.groupKey, req.myPeerId, { forceFull: true });
+    } catch (e) {
+      console.error(`Failed to push initial route update to ${req.myPeerId}:`, e.message);
+    }
 
   } catch (e) {
     console.error('Handshake error:', e);
@@ -111,8 +107,15 @@ export function handleForwarding(sourceWs, header, fullMessage, types, peerManag
     targetPeerId = foreign.dstPeerId;
     const networkName = foreign.networkName || (sourceWs && sourceWs.domainName) || getPublicServerNetworkName();
     body = wrapAsForeignNetwork(foreign.inner, targetPeerId, networkName);
+    const innerHeader = parseHeader(foreign.inner);
+    if (innerHeader) {
+      sniffPeerCenterReport(sourceWs, innerHeader, foreign.inner.subarray(16), types, peerManager);
+    }
   } else if (targetPeerId === MY_PEER_ID) {
     return false;
+  } else if (header.packetType === PacketType.RpcReq) {
+    const payload = Buffer.isBuffer(fullMessage) ? fullMessage.subarray(16) : Buffer.from(fullMessage).subarray(16);
+    sniffPeerCenterReport(sourceWs, header, payload, types, peerManager);
   }
 
   let targetWs = peerManager.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);

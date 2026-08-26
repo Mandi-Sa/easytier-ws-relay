@@ -2,7 +2,7 @@ import { Buffer } from 'buffer';
 import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String } from './crypto.js';
-import { getPublicServerNetworkName } from './env.js';
+import { getPublicServerNetworkName, digestBytesFromGroupKey } from './env.js';
 import { sendWs } from './env.js';
 import { RpcPieceMerger } from './rpc_pieces.js';
 import { parseConnBitmapEdges, parseConnPeerList, edgesFromConnPeerList, buildStarAndReportedBitmap } from './topology.js';
@@ -91,7 +91,9 @@ export class PeerManager {
     this.forwardOk = 0;
     this.onTopologyChange = null;
     this.reportedConns = new Map();
+    this.peerCenterConns = new Map();
     this.lastSyncByPeer = new Map();
+    this.lastPeerCenterByPeer = new Map();
     this.storage = null;
   }
 
@@ -111,6 +113,11 @@ export class PeerManager {
         }
       }
     }
+    const savedTopo = await storage.get('topology');
+    if (savedTopo && typeof savedTopo === 'object') {
+      this._loadConnStore(this.reportedConns, savedTopo.reported);
+      this._loadConnStore(this.peerCenterConns, savedTopo.peerCenter);
+    }
     const my = this.ensureMyInfo();
     if (typeof storage.put !== 'function') return;
     if (!instId) await storage.put('relayInstId', my.instId);
@@ -127,6 +134,37 @@ export class PeerManager {
     }
     try {
       await this.storage.put('connVersions', out);
+    } catch (_) { }
+  }
+
+  _dumpConnStore(store) {
+    const out = {};
+    for (const [gk, m] of store.entries()) {
+      out[gk] = {};
+      for (const [pid, set] of m.entries()) {
+        out[gk][String(pid)] = Array.from(set).map(Number);
+      }
+    }
+    return out;
+  }
+
+  _loadConnStore(store, dump) {
+    if (!dump || typeof dump !== 'object') return;
+    for (const [gk, mapObj] of Object.entries(dump)) {
+      const m = this._getConnMap(store, gk, true);
+      for (const [pid, arr] of Object.entries(mapObj || {})) {
+        m.set(Number(pid), new Set((arr || []).map(Number)));
+      }
+    }
+  }
+
+  async persistTopology() {
+    if (!this.storage || typeof this.storage.put !== 'function') return;
+    try {
+      await this.storage.put('topology', {
+        reported: this._dumpConnStore(this.reportedConns),
+        peerCenter: this._dumpConnStore(this.peerCenterConns),
+      });
     } catch (_) { }
   }
 
@@ -236,32 +274,101 @@ export class PeerManager {
     }
   }
 
-  _getReportedConns(groupKey, create = false) {
+  _getConnMap(store, groupKey, create = false) {
     const k = String(groupKey || '');
-    let m = this.reportedConns.get(k);
+    let m = store.get(k);
     if (!m && create) {
       m = new Map();
-      this.reportedConns.set(k, m);
+      store.set(k, m);
     }
     return m;
   }
 
-  ingestReportedEdges(groupKey, fromPeerId, edges) {
-    const m = this._getReportedConns(groupKey, true);
+  _getReportedConns(groupKey, create = false) {
+    return this._getConnMap(this.reportedConns, groupKey, create);
+  }
+
+  _getPeerCenterConns(groupKey, create = false) {
+    return this._getConnMap(this.peerCenterConns, groupKey, create);
+  }
+
+  _connectedSetFromEdges(fromPeerId, edges) {
     const connected = new Set();
     for (const [a, b] of edges || []) {
       const other = Number(a) === Number(fromPeerId) ? Number(b) : Number(b) === Number(fromPeerId) ? Number(a) : null;
       if (other == null || other === Number(fromPeerId) || other === MY_PEER_ID) continue;
       connected.add(other);
     }
+    return connected;
+  }
+
+  _bumpEdgeVersions(groupKey, peerIds) {
+    const seen = new Set();
+    for (const pid of peerIds) {
+      const n = Number(pid);
+      if (!n || seen.has(n)) continue;
+      seen.add(n);
+      this.bumpPeerConnVersion(groupKey, n);
+    }
+    this.bumpPeerConnVersion(groupKey, MY_PEER_ID);
+  }
+
+  _notifyTopology(groupKey) {
+    if (typeof this.onTopologyChange === 'function') {
+      try { this.onTopologyChange(groupKey); } catch (_) { }
+    }
+  }
+
+  ingestReportedEdges(groupKey, fromPeerId, edges) {
+    return this.ingestPeerCenterEdges(groupKey, fromPeerId, edges);
+  }
+
+  _writeUndirected(store, groupKey, fromPeerId, connected) {
+    const m = this._getConnMap(store, groupKey, true);
+    const from = Number(fromPeerId);
+    m.set(from, new Set(connected));
+    for (const dst of connected) {
+      const rev = m.get(Number(dst)) || new Set();
+      rev.add(from);
+      m.set(Number(dst), rev);
+    }
+  }
+
+  ingestPeerCenterEdges(groupKey, fromPeerId, edges) {
+    const connected = this._connectedSetFromEdges(fromPeerId, edges);
+    this.lastPeerCenterByPeer.set(Number(fromPeerId), Date.now());
+    if (connected.size === 0) return false;
+    const m = this._getPeerCenterConns(groupKey, true);
     const prev = m.get(Number(fromPeerId));
     const prevKey = prev ? Array.from(prev).sort().join(',') : '';
     const nextKey = Array.from(connected).sort().join(',');
-    m.set(Number(fromPeerId), connected);
-    if (prevKey !== nextKey) {
-      this.bumpPeerConnVersion(groupKey, fromPeerId);
-      this.bumpPeerConnVersion(groupKey, MY_PEER_ID);
+    if (prevKey === nextKey) return false;
+    this._writeUndirected(this.peerCenterConns, groupKey, fromPeerId, connected);
+    this._bumpEdgeVersions(groupKey, [fromPeerId, ...connected]);
+    this.persistTopology();
+    this._notifyTopology(groupKey);
+    return true;
+  }
+
+  ingestOspfEdges(groupKey, fromPeerId, edges) {
+    const connected = this._connectedSetFromEdges(fromPeerId, edges);
+    if (connected.size === 0) return false;
+    const m = this._getReportedConns(groupKey, true);
+    const prev = m.get(Number(fromPeerId)) || new Set();
+    const merged = new Set(prev);
+    let changed = false;
+    for (const dst of connected) {
+      if (!merged.has(dst)) {
+        merged.add(dst);
+        changed = true;
+      }
     }
+    if (!changed) return false;
+    this._writeUndirected(this.reportedConns, groupKey, fromPeerId, merged);
+    this._bumpEdgeVersions(groupKey, [fromPeerId, ...connected]);
+    this.persistTopology();
+    this._notifyTopology(groupKey);
+    return true;
   }
 
   ingestConnInfo(groupKey, fromPeerId, syncReq, rawSyncBytes) {
@@ -273,22 +380,32 @@ export class PeerManager {
       const list = parseConnPeerList(rawSyncBytes);
       edges.push(...edgesFromConnPeerList(list, fromPeerId));
     }
-    this.ingestReportedEdges(groupKey, fromPeerId, edges);
+    this.ingestOspfEdges(groupKey, fromPeerId, edges);
     this.notePeerSync(fromPeerId);
   }
 
   collectReportedEdges(groupKey) {
     const live = new Set(this.listPeerIdsInGroup(groupKey).map(Number));
     live.add(MY_PEER_ID);
-    const edges = [];
-    const m = this._getReportedConns(groupKey, false);
-    if (!m) return edges;
-    for (const [src, dsts] of m.entries()) {
-      if (!live.has(Number(src))) continue;
-      for (const dst of dsts) {
-        if (!live.has(Number(dst))) continue;
-        edges.push([Number(src), Number(dst)]);
+    const pairSet = new Set();
+    const add = (src, dst) => {
+      const a = Number(src);
+      const b = Number(dst);
+      if (!live.has(a) || !live.has(b) || a === b || a === MY_PEER_ID || b === MY_PEER_ID) return;
+      const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+      pairSet.add(key);
+    };
+    for (const store of [this.peerCenterConns, this.reportedConns]) {
+      const m = this._getConnMap(store, groupKey, false);
+      if (!m) continue;
+      for (const [src, dsts] of m.entries()) {
+        for (const dst of dsts) add(src, dst);
       }
+    }
+    const edges = [];
+    for (const key of pairSet) {
+      const [a, b] = key.split('-').map(Number);
+      edges.push([a, b]);
     }
     return edges;
   }
@@ -469,7 +586,10 @@ export class PeerManager {
     this._clearInstId(groupKey, peerId);
     const reported = this._getReportedConns(groupKey, false);
     if (reported) reported.delete(Number(peerId));
+    const center = this._getPeerCenterConns(groupKey, false);
+    if (center) center.delete(Number(peerId));
     this.lastSyncByPeer.delete(Number(peerId));
+    this.lastPeerCenterByPeer.delete(Number(peerId));
     return true;
   }
 
@@ -567,7 +687,19 @@ export class PeerManager {
       forwardOk: this.forwardOk,
       peerIds: this.listAllPeerIds(),
       lastSync: Object.fromEntries(this.lastSyncByPeer.entries()),
+      lastPeerCenter: Object.fromEntries(this.lastPeerCenterByPeer.entries()),
+      reportedEdges: this.collectAllReportedEdges(),
     };
+  }
+
+  collectAllReportedEdges() {
+    const out = [];
+    for (const gk of new Set([...this.peerCenterConns.keys(), ...this.reportedConns.keys()])) {
+      for (const [a, b] of this.collectReportedEdges(gk)) {
+        out.push([a, b]);
+      }
+    }
+    return out;
   }
 
   listAllPeerIds() {
@@ -756,24 +888,38 @@ export class PeerManager {
     const foreignNetworkInfos = (() => {
       const mode = (process.env.EASYTIER_HANDSHAKE_MODE || 'foreign').toLowerCase();
       if (mode === 'same' || mode === 'same_network') return null;
-      const version = session.foreignNetVer + 1;
+      const version = Math.max(session.foreignNetVer + 1, Math.floor(Date.now() / 1000));
       session.foreignNetVer = version;
       const livePeers = this.listPeerIdsInGroup(groupKey);
-      return {
-        infos: [{
-          key: {
-            peerId: MY_PEER_ID,
-            networkName: getPublicServerNetworkName()
-          },
+      const digest = digestBytesFromGroupKey(groupKey);
+      const now = { seconds: Math.floor(Date.now() / 1000), nanos: 0 };
+      const infos = [{
+        key: {
+          peerId: MY_PEER_ID,
+          networkName: getPublicServerNetworkName()
+        },
+        value: {
+          foreignPeerIds: livePeers,
+          lastUpdate: now,
+          version,
+          networkSecretDigest: digest,
+          myPeerIdForThisNetwork: MY_PEER_ID
+        }
+      }];
+      const staleName = 'dev-websocket-relay';
+      if (getPublicServerNetworkName() !== staleName) {
+        infos.push({
+          key: { peerId: MY_PEER_ID, networkName: staleName },
           value: {
-            foreignPeerIds: livePeers,
-            lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
+            foreignPeerIds: [],
+            lastUpdate: now,
             version,
             networkSecretDigest: Buffer.alloc(32),
             myPeerIdForThisNetwork: MY_PEER_ID
           }
-        }]
-      };
+        });
+      }
+      return { infos };
     })();
 
     const t = this.types;

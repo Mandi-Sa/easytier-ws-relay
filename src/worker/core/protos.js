@@ -22,5 +22,6 @@ export function loadProtos() {
     GetGlobalPeerMapResponse: peerRpc.GetGlobalPeerMapResponse,
     PeerInfoForGlobalMap: peerRpc.PeerInfoForGlobalMap,
     GlobalPeerMap: peerRpc.GlobalPeerMap,
+    GetIpListResponse: peerRpc.GetIpListResponse,
   };
 }
