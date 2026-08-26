@@ -1,6 +1,5 @@
-import { Buffer } from 'buffer';
-import { parseHeader, bufferFromMessage } from './core/packet.js';
-import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
+import { bufferFromMessage } from './core/packet.js';
+import { PacketType, MY_PEER_ID } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
 import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
@@ -85,33 +84,8 @@ export class RelayRoom {
         debugLog('[ws] parseHeader failed');
         return;
       }
-      debugLog(`[ws] header from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
-      const payload = buffer.subarray(HEADER_SIZE);
-      switch (header.packetType) {
-        case PacketType.HandShake:
-          handleHandshake(ws, header, payload, this.types, this.peerManager);
-          break;
-        case PacketType.Ping:
-          handlePing(ws, header, payload);
-          break;
-        case PacketType.RpcReq:
-          if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
-            handleRpcReq(ws, header, payload, this.types, this.peerManager);
-            break;
-          }
-          handleForwarding(ws, header, buffer, this.types, this.peerManager);
-          break;
-        case PacketType.RpcResp:
-          if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
-            handleRpcResp(ws, header, payload, this.types, this.peerManager);
-            break;
-          }
-          handleForwarding(ws, header, buffer, this.types, this.peerManager);
-          break;
-        case PacketType.Data:
-        default:
-          handleForwarding(ws, header, buffer, this.types, this.peerManager);
-      }
+      const payload = buffer.subarray(16);
+      this._dispatchPacket(ws, { header, payload, raw: buffer });
     } catch (e) {
       console.error('relay_room message handling error:', e);
       try { ws.close(1011, 'internal error'); } catch (_) { }
@@ -133,6 +107,36 @@ export class RelayRoom {
 
   async webSocketError(ws) {
     await this.webSocketClose(ws);
+  }
+
+  _dispatchPacket(ws, pkt) {
+    const { header, payload, raw } = pkt;
+    debugLog(`[ws] header from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
+    switch (header.packetType) {
+      case PacketType.HandShake:
+        handleHandshake(ws, header, payload, this.types, this.peerManager);
+        break;
+      case PacketType.Ping:
+        handlePing(ws, header, payload);
+        break;
+      case PacketType.RpcReq:
+        if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
+          handleRpcReq(ws, header, payload, this.types, this.peerManager);
+          break;
+        }
+        handleForwarding(ws, header, raw, this.types, this.peerManager);
+        break;
+      case PacketType.RpcResp:
+        if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
+          handleRpcResp(ws, header, payload, this.types, this.peerManager);
+          break;
+        }
+        handleForwarding(ws, header, raw, this.types, this.peerManager);
+        break;
+      case PacketType.Data:
+      default:
+        handleForwarding(ws, header, raw, this.types, this.peerManager);
+    }
   }
 
   _initSocket(ws, meta = {}) {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import zlib from 'zlib';
 import { PeerManager } from '../src/worker/core/peer_manager.js';
 import { MY_PEER_ID, HEADER_SIZE } from '../src/worker/core/constants.js';
-import { parseHeader, createHeader, bufferFromMessage } from '../src/worker/core/packet.js';
+import { parseHeader, createHeader, bufferFromMessage, splitPackets } from '../src/worker/core/packet.js';
 import { RpcPieceMerger } from '../src/worker/core/rpc_pieces.js';
 import { decompressRpcBody } from '../src/worker/core/compress.js';
 import { RPC_COMPRESSION_NONE, RPC_COMPRESSION_ZSTD } from '../src/worker/core/rpc_compress.js';
@@ -97,13 +97,28 @@ test('peer center map only includes live sockets', () => {
   assert.equal(Object.prototype.hasOwnProperty.call(map, String(MY_PEER_ID)), false);
 });
 
-test('parseHeader rejects truncated payloads', () => {
+test('parseHeader accepts extra trailing bytes used by data frames', () => {
   const payload = Buffer.from('abcd');
   const header = createHeader(1, 2, 8, payload.length);
   const full = Buffer.concat([header, payload]);
   assert.equal(parseHeader(full).len, payload.length);
-  assert.equal(parseHeader(full.subarray(0, HEADER_SIZE + 1)), null);
-  assert.equal(parseHeader(Buffer.concat([full, Buffer.from([0])])), null);
+  assert.equal(parseHeader(full.subarray(0, HEADER_SIZE - 1)), null);
+  const withTail = Buffer.concat([full, Buffer.from([0, 1, 2])]);
+  assert.equal(parseHeader(withTail).len, payload.length);
+  const packets = splitPackets(withTail);
+  assert.equal(packets.length, 1);
+  assert.equal(packets[0].payload.toString(), 'abcd');
+});
+
+test('splitPackets forwards coalesced data frames separately', () => {
+  const a = Buffer.concat([createHeader(1, 2, 1, 2), Buffer.from('aa')]);
+  const b = Buffer.concat([createHeader(1, 3, 1, 2), Buffer.from('bb')]);
+  const packets = splitPackets(Buffer.concat([a, b]));
+  assert.equal(packets.length, 2);
+  assert.equal(packets[0].header.toPeerId, 2);
+  assert.equal(packets[0].payload.toString(), 'aa');
+  assert.equal(packets[1].header.toPeerId, 3);
+  assert.equal(packets[1].payload.toString(), 'bb');
 });
 
 test('bufferFromMessage honors TypedArray byteOffset', () => {

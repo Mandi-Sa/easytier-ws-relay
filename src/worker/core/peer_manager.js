@@ -85,6 +85,7 @@ export class PeerManager {
     this.storedInstId = null;
     this.storedPeerRouteId = null;
     this.syncFailures = 0;
+    this.forwardDrops = 0;
   }
 
   async hydrateIdentity(storage) {
@@ -447,7 +448,29 @@ export class PeerManager {
       peers,
       groups: this.peersByGroup.size,
       syncFailures: this.syncFailures,
+      forwardDrops: this.forwardDrops,
+      peerIds: this.listAllPeerIds(),
     };
+  }
+
+  listAllPeerIds() {
+    const ids = [];
+    for (const m of this.peersByGroup.values()) {
+      for (const pid of m.keys()) ids.push(pid);
+    }
+    return ids;
+  }
+
+  findPeerWs(peerId) {
+    for (const m of this.peersByGroup.values()) {
+      const ws = m.get(peerId);
+      if (ws) return ws;
+    }
+    return undefined;
+  }
+
+  noteForwardDrop() {
+    this.forwardDrops += 1;
   }
 
   noteSyncFailure() {

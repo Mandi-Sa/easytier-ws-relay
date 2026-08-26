@@ -85,12 +85,19 @@ export function handlePing(ws, header, payload) {
 
 export function handleForwarding(sourceWs, header, fullMessage, types, peerManager) {
   const targetPeerId = header.toPeerId;
-  const targetWs = peerManager.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);
+  if (targetPeerId === MY_PEER_ID) {
+    return;
+  }
+  let targetWs = peerManager.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);
+  if (!targetWs) {
+    targetWs = peerManager.findPeerWs(targetPeerId);
+  }
 
   if (targetWs && targetWs.readyState === WS_OPEN) {
     const srcGroup = sourceWs && sourceWs.groupKey;
     const dstGroup = targetWs && targetWs.groupKey;
     if (srcGroup && dstGroup && srcGroup !== dstGroup) {
+      peerManager.noteForwardDrop();
       return;
     }
     try {
@@ -104,5 +111,7 @@ export function handleForwarding(sourceWs, header, fullMessage, types, peerManag
         console.error(`Broadcast after forward failure failed: ${err.message}`);
       }
     }
+  } else {
+    peerManager.noteForwardDrop();
   }
 }

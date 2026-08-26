@@ -15,10 +15,6 @@ export function bufferFromMessage(message) {
 
 export function parseHeader(buffer) {
   if (!buffer || buffer.length < HEADER_SIZE) return null;
-  const len = buffer.readUInt32LE(12);
-  if (!Number.isFinite(len) || len < 0 || buffer.length !== HEADER_SIZE + len) {
-    return null;
-  }
   return {
     fromPeerId: buffer.readUInt32LE(0),
     toPeerId: buffer.readUInt32LE(4),
@@ -26,8 +22,28 @@ export function parseHeader(buffer) {
     flags: buffer.readUInt8(9),
     forwardCounter: buffer.readUInt8(10),
     reserved: buffer.readUInt8(11),
-    len,
+    len: buffer.readUInt32LE(12),
   };
+}
+
+export function splitPackets(buffer) {
+  const packets = [];
+  let offset = 0;
+  while (offset + HEADER_SIZE <= buffer.length) {
+    const slice = buffer.subarray(offset);
+    const header = parseHeader(slice);
+    if (!header) break;
+    const available = slice.length - HEADER_SIZE;
+    const take = (Number.isFinite(header.len) && header.len >= 0 && header.len <= available)
+      ? header.len
+      : available;
+    const raw = slice.subarray(0, HEADER_SIZE + take);
+    const payload = raw.subarray(HEADER_SIZE);
+    packets.push({ header, payload, raw });
+    offset += raw.length;
+    if (take === available && header.len > available) break;
+  }
+  return packets;
 }
 
 export function createHeader(fromPeerId, toPeerId, packetType, payloadLen) {
