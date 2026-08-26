@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import zlib from 'zlib';
+import { readFileSync } from 'node:fs';
 import { PeerManager } from '../src/worker/core/peer_manager.js';
-import { MY_PEER_ID, HEADER_SIZE } from '../src/worker/core/constants.js';
-import { parseHeader, createHeader, bufferFromMessage, splitPackets } from '../src/worker/core/packet.js';
+import { parseHeader, createHeader, bufferFromMessage, splitPackets, parseForeignNetworkPayload, buildForeignNetworkPayload } from '../src/worker/core/packet.js';
+import { MY_PEER_ID, HEADER_SIZE, PacketType } from '../src/worker/core/constants.js';
+import { handleForwarding } from '../src/worker/core/basic_handlers.js';
 import { RpcPieceMerger } from '../src/worker/core/rpc_pieces.js';
 import { decompressRpcBody } from '../src/worker/core/compress.js';
 import { RPC_COMPRESSION_NONE, RPC_COMPRESSION_ZSTD } from '../src/worker/core/rpc_compress.js';
@@ -12,6 +14,12 @@ import {
   shouldAcceptConnection,
   debugEnabled,
 } from '../src/worker/core/env.js';
+
+test('relay_room imports parseHeader for handshake dispatch', () => {
+  const src = readFileSync(new URL('../src/worker/relay_room.js', import.meta.url), 'utf8');
+  assert.match(src, /import \{[^}]*parseHeader[^}]*\} from '\.\/core\/packet\.js'/);
+  assert.match(src, /parseHeader\(buffer\)/);
+});
 
 function ws(peerId, groupKey = 'g') {
   return { peerId, groupKey, readyState: 1, close() { this.readyState = 3; } };
@@ -156,4 +164,36 @@ test('debug logging is off by default', () => {
   assert.equal(debugEnabled(), true);
   if (prev === undefined) delete process.env.EASYTIER_DEBUG;
   else process.env.EASYTIER_DEBUG = prev;
+});
+
+test('foreign network payload roundtrip exposes dst peer and inner packet', () => {
+  const inner = Buffer.concat([createHeader(111, 222, PacketType.Data, 4), Buffer.from('ping')]);
+  const payload = buildForeignNetworkPayload(222, 'public_server', inner);
+  const parsed = parseForeignNetworkPayload(payload);
+  assert.equal(parsed.dstPeerId, 222);
+  assert.equal(parsed.networkName, 'public_server');
+  assert.equal(Buffer.compare(parsed.inner, inner), 0);
+});
+
+test('foreign network packet to the relay is unwrapped and forwarded', () => {
+  const pm = new PeerManager();
+  const sent = [];
+  const dst = {
+    peerId: 222,
+    groupKey: 'g',
+    readyState: 1,
+    send(buf) { sent.push(Buffer.from(buf)); },
+    close() { this.readyState = 3; },
+  };
+  const src = { peerId: 111, groupKey: 'g', readyState: 1, close() { this.readyState = 3; } };
+  pm.addPeer(222, dst);
+  const inner = Buffer.concat([createHeader(111, 222, PacketType.Data, 4), Buffer.from('ping')]);
+  const payload = buildForeignNetworkPayload(222, 'public_server', inner);
+  const outer = Buffer.concat([createHeader(111, MY_PEER_ID, PacketType.ForeignNetworkPacket, payload.length), payload]);
+  const header = parseHeader(outer);
+  const ok = handleForwarding(src, header, outer, null, pm);
+  assert.equal(ok, true);
+  assert.equal(sent.length, 1);
+  assert.equal(Buffer.compare(sent[0], inner), 0);
+  assert.equal(pm.getStats().forwardOk, 1);
 });

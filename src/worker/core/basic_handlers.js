@@ -1,11 +1,13 @@
+import { Buffer } from 'buffer';
 import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
-import { createHeader } from './packet.js';
+import { createHeader, parseForeignNetworkPayload } from './packet.js';
 import { wrapPacket, randomU64String } from './crypto.js';
-import { getPublicServerNetworkName, persistSocketMeta, debugLog } from './env.js';
+import { getPublicServerNetworkName, persistSocketMeta, debugLog, sendWs } from './env.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
 
 export function handleHandshake(ws, header, payload, types, peerManager) {
+  let sent = false;
   try {
     const req = types.HandshakeRequest.decode(payload);
     try {
@@ -52,7 +54,9 @@ export function handleHandshake(ws, header, payload, types, peerManager) {
 
     const respBuffer = types.HandshakeRequest.encode(respPayload).finish();
     const respHeader = createHeader(MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer.length);
-    ws.send(Buffer.concat([respHeader, Buffer.from(respBuffer)]));
+    const out = Buffer.concat([respHeader, Buffer.from(respBuffer)]);
+    sendWs(ws, out);
+    sent = true;
     if (!ws.serverSessionId) {
       ws.serverSessionId = randomU64String();
     }
@@ -74,44 +78,58 @@ export function handleHandshake(ws, header, payload, types, peerManager) {
 
   } catch (e) {
     console.error('Handshake error:', e);
-    ws.close();
+    if (!sent) {
+      try { ws.close(); } catch (_) { }
+    }
   }
 }
 
 export function handlePing(ws, header, payload) {
   const msg = wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws);
-  ws.send(msg);
+  sendWs(ws, msg);
 }
 
 export function handleForwarding(sourceWs, header, fullMessage, types, peerManager) {
-  const targetPeerId = header.toPeerId;
-  if (targetPeerId === MY_PEER_ID) {
-    return;
+  let targetPeerId = header.toPeerId;
+  let body = fullMessage;
+
+  if (header.packetType === PacketType.ForeignNetworkPacket && header.toPeerId === MY_PEER_ID) {
+    const foreign = parseForeignNetworkPayload(
+      Buffer.isBuffer(fullMessage) ? fullMessage.subarray(16) : Buffer.from(fullMessage).subarray(16)
+    );
+    if (!foreign || !foreign.inner || foreign.inner.length < 16) {
+      peerManager.noteForwardDrop();
+      return false;
+    }
+    targetPeerId = foreign.dstPeerId;
+    body = foreign.inner;
+  } else if (targetPeerId === MY_PEER_ID) {
+    return false;
   }
+
   let targetWs = peerManager.getPeerWs(targetPeerId, sourceWs && sourceWs.groupKey);
   if (!targetWs) {
     targetWs = peerManager.findPeerWs(targetPeerId);
   }
 
   if (targetWs && targetWs.readyState === WS_OPEN) {
-    const srcGroup = sourceWs && sourceWs.groupKey;
-    const dstGroup = targetWs && targetWs.groupKey;
-    if (srcGroup && dstGroup && srcGroup !== dstGroup) {
-      peerManager.noteForwardDrop();
-      return;
-    }
     try {
-      targetWs.send(fullMessage);
+      sendWs(targetWs, body);
+      peerManager.noteForwardOk();
+      return true;
     } catch (e) {
       console.error(`Forward to ${targetPeerId} failed: ${e.message}`);
+      const groupKey = sourceWs && sourceWs.groupKey;
       peerManager.removePeer(targetWs);
       try {
-        peerManager.broadcastRouteUpdate(types, srcGroup);
+        peerManager.broadcastRouteUpdate(types, groupKey);
       } catch (err) {
         console.error(`Broadcast after forward failure failed: ${err.message}`);
       }
+      peerManager.noteForwardDrop();
+      return false;
     }
-  } else {
-    peerManager.noteForwardDrop();
   }
+  peerManager.noteForwardDrop();
+  return false;
 }

@@ -3,6 +3,7 @@ import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String } from './crypto.js';
 import { getPublicServerNetworkName } from './env.js';
+import { sendWs } from './env.js';
 import { RpcPieceMerger } from './rpc_pieces.js';
 
 const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
@@ -86,6 +87,7 @@ export class PeerManager {
     this.storedPeerRouteId = null;
     this.syncFailures = 0;
     this.forwardDrops = 0;
+    this.forwardOk = 0;
   }
 
   async hydrateIdentity(storage) {
@@ -449,6 +451,7 @@ export class PeerManager {
       groups: this.peersByGroup.size,
       syncFailures: this.syncFailures,
       forwardDrops: this.forwardDrops,
+      forwardOk: this.forwardOk,
       peerIds: this.listAllPeerIds(),
     };
   }
@@ -471,6 +474,10 @@ export class PeerManager {
 
   noteForwardDrop() {
     this.forwardDrops += 1;
+  }
+
+  noteForwardOk() {
+    this.forwardOk += 1;
   }
 
   noteSyncFailure() {
@@ -719,7 +726,7 @@ export class PeerManager {
 
     const rpcPacketBytes = t.RpcPacket.encode(rpcReqPacket).finish();
     try {
-      ws.send(wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
+      sendWs(ws, wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
     } catch (e) {
       // ignore
     }

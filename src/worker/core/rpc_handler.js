@@ -3,7 +3,7 @@ import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String, sha256 } from './crypto.js';
 import { decompressRpcBody } from './compress.js';
 import { negotiateRpcCompression } from './rpc_compress.js';
-import { debugLog } from './env.js';
+import { debugLog, sendWs, getPublicServerNetworkName } from './env.js';
 
 function calcPeerCenterDigestFromMap(mapObj) {
   const h = sha256();
@@ -63,7 +63,7 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
   const rpcPacketBytes = types.RpcPacket.encode(rpcRespPacket).finish();
   const buf = wrapPacket(createHeader, MY_PEER_ID, toPeerId, PacketType.RpcResp, rpcPacketBytes, ws);
   try {
-    ws.send(buf);
+    sendWs(ws, buf);
     debugLog(`RpcResp -> to=${toPeerId} txLen=${buf.length} txTransaction=${reqRpcPacket.transactionId}`);
   } catch (e) {
     console.error(`sendRpcResponse to ${toPeerId} failed: ${e.message}`);

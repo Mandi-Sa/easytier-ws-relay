@@ -14,7 +14,7 @@ export default {
     }
 
     if (pathname === '/stats') {
-      const roomId = searchParams.get('room') || 'default';
+      const roomId = searchParams.get('room') || 'default-v2';
       const roomStub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
       return roomStub.fetch(request);
     }
@@ -25,7 +25,7 @@ export default {
         return new Response('Expected WebSocket upgrade', { status: 400 });
       }
 
-      const roomId = searchParams.get('room') || 'default';
+      const roomId = searchParams.get('room') || 'default-v2';
       const roomStub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
       return roomStub.fetch(request);
     }

@@ -1,4 +1,4 @@
-import { bufferFromMessage } from './core/packet.js';
+import { bufferFromMessage, parseHeader } from './core/packet.js';
 import { PacketType, MY_PEER_ID } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
 import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';

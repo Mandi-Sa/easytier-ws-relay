@@ -1,3 +1,4 @@
+import { Buffer } from 'buffer';
 import { HEADER_SIZE } from './constants.js';
 
 export function bufferFromMessage(message) {
@@ -56,4 +57,35 @@ export function createHeader(fromPeerId, toPeerId, packetType, payloadLen) {
   buffer.writeUInt8(0, 11);
   buffer.writeUInt32LE(payloadLen, 12);
   return buffer;
+}
+
+// ForeignNetworkPacketHeader is packed LE:
+// u16 header_len, u32 dst_peer_id, u16 name_offset, u16 name_len, then name bytes.
+export function parseForeignNetworkPayload(payload) {
+  if (!payload || payload.length < 10) return null;
+  const headerLen = payload.readUInt16LE(0);
+  const dstPeerId = payload.readUInt32LE(2);
+  const nameOff = payload.readUInt16LE(6);
+  const nameLen = payload.readUInt16LE(8);
+  if (!Number.isFinite(headerLen) || headerLen < 10 || headerLen > payload.length) return null;
+  if (nameOff + nameLen > payload.length) return null;
+  return {
+    headerLen,
+    dstPeerId,
+    networkName: payload.subarray(nameOff, nameOff + nameLen).toString('utf8'),
+    inner: payload.subarray(headerLen),
+  };
+}
+
+export function buildForeignNetworkPayload(dstPeerId, networkName, innerPacket) {
+  const name = Buffer.from(String(networkName || ''), 'utf8');
+  const headerLen = 10 + name.length;
+  const payload = Buffer.alloc(headerLen + innerPacket.length);
+  payload.writeUInt16LE(headerLen, 0);
+  payload.writeUInt32LE(dstPeerId, 2);
+  payload.writeUInt16LE(10, 6);
+  payload.writeUInt16LE(name.length, 8);
+  name.copy(payload, 10);
+  innerPacket.copy(payload, headerLen);
+  return payload;
 }

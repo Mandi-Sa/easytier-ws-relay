@@ -62,3 +62,20 @@ export function connectionLimit(env) {
 export function shouldAcceptConnection(current, max) {
   return Number(current) < Number(max);
 }
+
+export function sendWs(ws, data) {
+  if (!ws || typeof ws.send !== 'function') return;
+  let u8;
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(data)) {
+    u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  } else if (data instanceof ArrayBuffer) {
+    u8 = new Uint8Array(data);
+  } else if (ArrayBuffer.isView(data)) {
+    u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  } else {
+    u8 = Uint8Array.from(data);
+  }
+  const copy = new Uint8Array(u8.byteLength);
+  copy.set(u8);
+  ws.send(copy);
+}
