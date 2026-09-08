@@ -1,9 +1,10 @@
 import zlib from 'zlib';
+import { decompress as fzstdDecompress } from 'fzstd';
 import { RPC_COMPRESSION_NONE, RPC_COMPRESSION_ZSTD } from './rpc_compress.js';
 
 const hasZlib = !!(zlib && typeof zlib.gzipSync === 'function' && typeof zlib.gunzipSync === 'function');
-const hasZstdDecompress = !!(zlib && typeof zlib.zstdDecompressSync === 'function');
-const hasZstdCompress = !!(zlib && typeof zlib.zstdCompressSync === 'function');
+const hasNodeZstdDecompress = !!(zlib && typeof zlib.zstdDecompressSync === 'function');
+const hasNodeZstdCompress = !!(zlib && typeof zlib.zstdCompressSync === 'function');
 
 export function gzipMaybe(data) {
   if (hasZlib) {
@@ -23,15 +24,19 @@ export function isCompressionAvailable() {
   return hasZlib;
 }
 
+export function isZstdDecompressAvailable() {
+  return hasNodeZstdDecompress || typeof fzstdDecompress === 'function';
+}
+
 export function isZstdAvailable() {
-  return hasZstdCompress && hasZstdDecompress;
+  return hasNodeZstdCompress && isZstdDecompressAvailable();
 }
 
 export function compressRpcBody(body, algo) {
   const a = Number(algo || RPC_COMPRESSION_NONE);
   if (!body || a <= RPC_COMPRESSION_NONE) return body;
   if (a === RPC_COMPRESSION_ZSTD) {
-    if (!hasZstdCompress) throw new Error('zstd unavailable');
+    if (!hasNodeZstdCompress) throw new Error('zstd unavailable');
     return zlib.zstdCompressSync(body);
   }
   throw new Error(`unsupported rpc compression algo ${a}`);
@@ -43,10 +48,18 @@ export function decompressRpcBody(body, algo) {
     return body;
   }
   if (a === RPC_COMPRESSION_ZSTD) {
-    if (!hasZstdDecompress) {
+    const input = Buffer.isBuffer(body) ? body : Buffer.from(body);
+    if (hasNodeZstdDecompress) {
+      try {
+        return zlib.zstdDecompressSync(input);
+      } catch (_) {
+        // fall through to fzstd (Workers nodejs_compat may advertise the name)
+      }
+    }
+    if (typeof fzstdDecompress !== 'function') {
       throw new Error('zstd unavailable');
     }
-    return zlib.zstdDecompressSync(body);
+    return Buffer.from(fzstdDecompress(input));
   }
   throw new Error(`unsupported rpc compression algo ${a}`);
 }

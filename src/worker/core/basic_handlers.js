@@ -3,7 +3,7 @@ import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader, parseForeignNetworkPayload, wrapAsForeignNetwork, parseHeader } from './packet.js';
 import { wrapPacket, randomU64String, deriveKeys } from './crypto.js';
 import { getPublicServerNetworkName, persistSocketMeta, debugLog, sendWs, handshakeDigestBytes } from './env.js';
-import { sniffPeerCenterReport } from './rpc_handler.js';
+import { sniffPeerCenterReport, handleRpcReq, handleRpcResp } from './rpc_handler.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
 
@@ -109,11 +109,22 @@ export function handleForwarding(sourceWs, header, fullMessage, types, peerManag
     body = wrapAsForeignNetwork(foreign.inner, targetPeerId, networkName);
     const innerHeader = parseHeader(foreign.inner);
     if (innerHeader) {
-      sniffPeerCenterReport(sourceWs, innerHeader, foreign.inner.subarray(16), types, peerManager);
+      const innerPayload = foreign.inner.subarray(16);
+      if (innerHeader.toPeerId === MY_PEER_ID) {
+        if (innerHeader.packetType === PacketType.RpcReq) {
+          handleRpcReq(sourceWs, innerHeader, innerPayload, types, peerManager);
+          return true;
+        }
+        if (innerHeader.packetType === PacketType.RpcResp) {
+          handleRpcResp(sourceWs, innerHeader, innerPayload, types, peerManager);
+          return true;
+        }
+      }
+      sniffPeerCenterReport(sourceWs, innerHeader, innerPayload, types, peerManager);
     }
   } else if (targetPeerId === MY_PEER_ID) {
     return false;
-  } else if (header.packetType === PacketType.RpcReq) {
+  } else if (header.packetType === PacketType.RpcReq || header.packetType === PacketType.RpcResp) {
     const payload = Buffer.isBuffer(fullMessage) ? fullMessage.subarray(16) : Buffer.from(fullMessage).subarray(16);
     sniffPeerCenterReport(sourceWs, header, payload, types, peerManager);
   }

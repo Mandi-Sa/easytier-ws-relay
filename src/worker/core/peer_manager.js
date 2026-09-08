@@ -5,7 +5,8 @@ import { wrapPacket, randomU64String } from './crypto.js';
 import { getPublicServerNetworkName, digestBytesFromGroupKey } from './env.js';
 import { sendWs } from './env.js';
 import { RpcPieceMerger } from './rpc_pieces.js';
-import { parseConnBitmapEdges, parseConnPeerList, edgesFromConnPeerList, buildStarAndReportedBitmap } from './topology.js';
+import { parseConnBitmapEdges, parseConnPeerList, hasConnPeerList, connRowsFromPeerList, buildStarAndReportedBitmap } from './topology.js';
+import { isZstdDecompressAvailable } from './compress.js';
 
 const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
 
@@ -78,6 +79,10 @@ export class PeerManager {
     this.myInfo = null; // lazily initialized to avoid random in global scope
     this.sessionTtlMs = Number(process.env.EASYTIER_SESSION_TTL_MS || 3 * 60 * 1000);
     this.lastSessionCleanup = 0;
+    this.topologyTtlMs = Number(process.env.EASYTIER_TOPOLOGY_TTL_MS || 3 * 60 * 1000);
+    if (!Number.isFinite(this.topologyTtlMs) || this.topologyTtlMs <= 0) this.topologyTtlMs = 3 * 60 * 1000;
+    this.peerCenterTtlMs = Number(process.env.EASYTIER_PEER_CENTER_TTL_MS || 3 * 60 * 1000);
+    if (!Number.isFinite(this.peerCenterTtlMs) || this.peerCenterTtlMs <= 0) this.peerCenterTtlMs = 3 * 60 * 1000;
 
     this.pureP2PMode = (process.env.EASYTIER_DISABLE_RELAY === '1');
     this.networkDigests = new Map();
@@ -94,6 +99,9 @@ export class PeerManager {
     this.peerCenterConns = new Map();
     this.lastSyncByPeer = new Map();
     this.lastPeerCenterByPeer = new Map();
+    this.peerCenterPulls = 0;
+    this.lastPeerCenterPullPeer = 0;
+    this.lastRpcError = '';
     this.storage = null;
   }
 
@@ -115,8 +123,9 @@ export class PeerManager {
     }
     const savedTopo = await storage.get('topology');
     if (savedTopo && typeof savedTopo === 'object') {
-      this._loadConnStore(this.reportedConns, savedTopo.reported);
-      this._loadConnStore(this.peerCenterConns, savedTopo.peerCenter);
+      const loadedAt = Date.now();
+      this._loadConnStore(this.reportedConns, savedTopo.reported, loadedAt);
+      this._loadConnStore(this.peerCenterConns, savedTopo.peerCenter, loadedAt);
     }
     const my = this.ensureMyInfo();
     if (typeof storage.put !== 'function') return;
@@ -137,25 +146,123 @@ export class PeerManager {
     } catch (_) { }
   }
 
+  _snapshotPeers(snapshot) {
+    if (snapshot instanceof Set) return new Set(snapshot);
+    if (Array.isArray(snapshot)) return new Set(snapshot.map(Number));
+    if (snapshot && typeof snapshot === 'object') {
+      if (snapshot.peers instanceof Set) return new Set(snapshot.peers);
+      if (Array.isArray(snapshot.peers)) return new Set(snapshot.peers.map(Number));
+      if (Array.isArray(snapshot.connected)) return new Set(snapshot.connected.map(Number));
+    }
+    return new Set();
+  }
+
+  _snapshotVersion(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object' || snapshot instanceof Set || Array.isArray(snapshot)) return 0;
+    const version = Number(snapshot.version);
+    return Number.isFinite(version) && version >= 0 ? version : 0;
+  }
+
+  _snapshotUpdatedAt(snapshot, fallback = Date.now()) {
+    if (snapshot && typeof snapshot === 'object' && !(snapshot instanceof Set)) {
+      const value = Number(snapshot.updatedAt);
+      if (Number.isFinite(value)) return value;
+    }
+    return fallback;
+  }
+
+  _storeSnapshot(store, groupKey, peerId, connected, version = 0, updatedAt = Date.now(), legacy = false) {
+    const m = this._getConnMap(store, groupKey, true);
+    const snapshot = {
+      peers: Array.from(new Set(connected)).map(Number),
+      version: Number(version) || 0,
+      updatedAt: Number(updatedAt),
+    };
+    if (legacy) snapshot.legacy = true;
+    m.set(Number(peerId), snapshot);
+  }
+
   _dumpConnStore(store) {
     const out = {};
     for (const [gk, m] of store.entries()) {
       out[gk] = {};
-      for (const [pid, set] of m.entries()) {
-        out[gk][String(pid)] = Array.from(set).map(Number);
+      for (const [pid, snapshot] of m.entries()) {
+        out[gk][String(pid)] = {
+          peers: Array.from(this._snapshotPeers(snapshot)).map(Number),
+          version: this._snapshotVersion(snapshot),
+          updatedAt: this._snapshotUpdatedAt(snapshot),
+          ...(snapshot && snapshot.legacy ? { legacy: true } : {}),
+        };
       }
     }
     return out;
   }
 
-  _loadConnStore(store, dump) {
+  _loadConnStore(store, dump, loadedAt = Date.now()) {
     if (!dump || typeof dump !== 'object') return;
     for (const [gk, mapObj] of Object.entries(dump)) {
       const m = this._getConnMap(store, gk, true);
-      for (const [pid, arr] of Object.entries(mapObj || {})) {
-        m.set(Number(pid), new Set((arr || []).map(Number)));
+      for (const [pid, value] of Object.entries(mapObj || {})) {
+        // Pre-snapshot dumps were merge-only arrays and re-poison the mesh if reloaded.
+        if (Array.isArray(value)) continue;
+        if (!value || typeof value !== 'object') continue;
+        this._storeSnapshot(
+          store,
+          gk,
+          pid,
+          this._snapshotPeers(value),
+          this._snapshotVersion(value),
+          this._snapshotUpdatedAt(value, loadedAt),
+          !!value.legacy,
+        );
+      }
+      if (m.size === 0) store.delete(gk);
+    }
+  }
+
+  _clearPeerFromConnStore(store, groupKey, peerId, nowTs = Date.now()) {
+    const m = this._getConnMap(store, groupKey, false);
+    if (!m) return [];
+    const target = Number(peerId);
+    const changed = new Set();
+    for (const [sourceId, snapshot] of Array.from(m.entries())) {
+      const source = Number(sourceId);
+      const peers = this._snapshotPeers(snapshot);
+      const sourceRemoved = source === target;
+      const targetRemoved = peers.delete(target);
+      if (!sourceRemoved && !targetRemoved) continue;
+      changed.add(source);
+      if (sourceRemoved || peers.size === 0) {
+        m.delete(sourceId);
+      } else {
+        this._storeSnapshot(
+          store,
+          groupKey,
+          source,
+          peers,
+          Math.max(this._snapshotVersion(snapshot) + 1, Math.floor(nowTs / 1000)),
+          nowTs,
+          !!snapshot.legacy,
+        );
       }
     }
+    if (m.size === 0) store.delete(String(groupKey || ''));
+    return Array.from(changed);
+  }
+
+  _clearPeerFromTopology(groupKey, peerId, notify = true) {
+    const changed = new Set([Number(peerId)]);
+    let touched = false;
+    for (const store of [this.reportedConns, this.peerCenterConns]) {
+      const sources = this._clearPeerFromConnStore(store, groupKey, peerId);
+      if (sources.length > 0) touched = true;
+      for (const source of sources) changed.add(Number(source));
+    }
+    if (!touched) return false;
+    this._bumpEdgeVersions(groupKey, changed);
+    this.persistTopology();
+    if (notify) this._notifyTopology(groupKey);
+    return true;
   }
 
   async persistTopology() {
@@ -323,95 +430,273 @@ export class PeerManager {
     return this.ingestPeerCenterEdges(groupKey, fromPeerId, edges);
   }
 
-  _writeUndirected(store, groupKey, fromPeerId, connected) {
-    const m = this._getConnMap(store, groupKey, true);
-    const from = Number(fromPeerId);
-    m.set(from, new Set(connected));
-    for (const dst of connected) {
-      const rev = m.get(Number(dst)) || new Set();
-      rev.add(from);
-      m.set(Number(dst), rev);
+  _writePeerSnapshot(store, groupKey, peerId, connected, version = 0, updatedAt = Date.now(), allowUnversionedReplace = false) {
+    const current = this._getConnMap(store, groupKey, true).get(Number(peerId));
+    const incomingVersion = Number(version) || 0;
+    const currentVersion = this._snapshotVersion(current);
+    if (incomingVersion > 0 && incomingVersion < currentVersion) return false;
+    if (incomingVersion > 0 && incomingVersion === currentVersion) {
+      if (current && this._snapshotPeers(current).size === new Set(connected).size
+        && Array.from(this._snapshotPeers(current)).every((peer) => new Set(connected).has(peer))) {
+        this._storeSnapshot(store, groupKey, peerId, this._snapshotPeers(current), currentVersion, updatedAt, !!current.legacy);
+      }
+      return false;
     }
+    if (incomingVersion === 0 && current && currentVersion > 0 && !allowUnversionedReplace) return false;
+    const nextVersion = incomingVersion > 0
+      ? incomingVersion
+      : Math.max(currentVersion + 1, Math.floor(Number(updatedAt) / 1000));
+    const previous = this._snapshotPeers(current);
+    const next = new Set(connected);
+    const changed = previous.size !== next.size || Array.from(previous).some((peer) => !next.has(peer));
+    this._storeSnapshot(store, groupKey, peerId, next, nextVersion, updatedAt);
+    return changed;
   }
 
-  ingestPeerCenterEdges(groupKey, fromPeerId, edges) {
+  ingestPeerCenterEdges(groupKey, fromPeerId, edges, version = 0, updatedAt = Date.now()) {
     const connected = this._connectedSetFromEdges(fromPeerId, edges);
     this.lastPeerCenterByPeer.set(Number(fromPeerId), Date.now());
+    // Sniffed PeerCenter frames can arrive empty; do not treat that as a withdrawal.
     if (connected.size === 0) return false;
-    const m = this._getPeerCenterConns(groupKey, true);
-    const prev = m.get(Number(fromPeerId));
-    const prevKey = prev ? Array.from(prev).sort().join(',') : '';
-    const nextKey = Array.from(connected).sort().join(',');
-    if (prevKey === nextKey) return false;
-    this._writeUndirected(this.peerCenterConns, groupKey, fromPeerId, connected);
+    const changed = this._writePeerSnapshot(
+      this.peerCenterConns,
+      groupKey,
+      fromPeerId,
+      connected,
+      version,
+      updatedAt,
+      true,
+    );
+    if (!changed) return false;
     this._bumpEdgeVersions(groupKey, [fromPeerId, ...connected]);
     this.persistTopology();
     this._notifyTopology(groupKey);
     return true;
   }
 
-  ingestOspfEdges(groupKey, fromPeerId, edges) {
-    const connected = this._connectedSetFromEdges(fromPeerId, edges);
-    if (connected.size === 0) return false;
-    const m = this._getReportedConns(groupKey, true);
-    const prev = m.get(Number(fromPeerId)) || new Set();
-    const merged = new Set(prev);
+  pickPeerCenterId(groupKey) {
+    const ids = groupKey != null && groupKey !== ''
+      ? this.listPeerIdsInGroup(groupKey)
+      : this.listAllPeerIds();
+    let min = 0;
+    for (const id of ids) {
+      const n = Number(id);
+      if (!n || n === MY_PEER_ID) continue;
+      const info = groupKey != null && groupKey !== ''
+        ? this._getPeerInfosMap(groupKey, false)?.get(n)
+        : undefined;
+      if (info && info.featureFlag && info.featureFlag.isPublicServer) continue;
+      if (!min || n < min) min = n;
+    }
+    return min;
+  }
+
+  replacePeerCenterMap(groupKey, mapObj, updatedAt = Date.now()) {
+    const entries = Object.entries(mapObj || {});
+    if (entries.length === 0) return false;
+    const m = this._getConnMap(this.peerCenterConns, groupKey, true);
+    const nextReporters = new Set();
+    const snapshots = [];
+    for (const [src, info] of entries) {
+      const srcId = Number(src);
+      if (!srcId || srcId === MY_PEER_ID) continue;
+      nextReporters.add(srcId);
+      const rawDirect = (info && (info.directPeers || info.direct_peers)) || {};
+      const connected = new Set();
+      for (const dst of Object.keys(rawDirect)) {
+        const n = Number(dst);
+        if (!n || n === srcId || n === MY_PEER_ID) continue;
+        connected.add(n);
+      }
+      snapshots.push([srcId, connected]);
+    }
     let changed = false;
-    for (const dst of connected) {
-      if (!merged.has(dst)) {
-        merged.add(dst);
+    const changedPeerIds = new Set();
+    for (const [srcId, connected] of snapshots) {
+      this.lastPeerCenterByPeer.set(srcId, updatedAt);
+      if (connected.size === 0) {
+        if (m.has(srcId)) {
+          m.delete(srcId);
+          changed = true;
+          changedPeerIds.add(srcId);
+        }
+        continue;
+      }
+      if (this._writePeerSnapshot(this.peerCenterConns, groupKey, srcId, connected, 0, updatedAt, true)) {
         changed = true;
+        changedPeerIds.add(srcId);
+        for (const dst of connected) changedPeerIds.add(Number(dst));
+      }
+    }
+    for (const srcId of Array.from(m.keys())) {
+      const n = Number(srcId);
+      if (nextReporters.has(n)) continue;
+      m.delete(n);
+      this.lastPeerCenterByPeer.delete(n);
+      changed = true;
+      changedPeerIds.add(n);
+    }
+    if (!changed) return false;
+    this._bumpEdgeVersions(groupKey, changedPeerIds);
+    this.persistTopology();
+    this._notifyTopology(groupKey);
+    return true;
+  }
+
+  dumpPeerCenterGraph(groupKey) {
+    const out = {};
+    const groups = groupKey != null
+      ? [groupKey]
+      : Array.from(this.peerCenterConns.keys());
+    for (const gk of groups) {
+      const m = this._getConnMap(this.peerCenterConns, gk, false);
+      if (!m) continue;
+      for (const [src, snapshot] of m.entries()) {
+        out[String(src)] = Array.from(this._snapshotPeers(snapshot)).sort((a, b) => a - b);
+      }
+    }
+    return out;
+  }
+
+  _ingestOspfRows(groupKey, rows, updatedAt = Date.now(), allowUnversionedReplace = false) {
+    let changed = false;
+    const changedPeerIds = new Set();
+    for (const row of rows || []) {
+      const peerId = Number(row.peerId);
+      if (!Number.isFinite(peerId) || peerId === 0 || peerId === MY_PEER_ID) continue;
+      const connected = new Set();
+      for (const dst of row.connected || []) {
+        const n = Number(dst);
+        if (!n || n === peerId || n === MY_PEER_ID) continue;
+        connected.add(n);
+      }
+      // A public-server SyncRouteInfo is usually the star (only the relay).
+      // Writing that empty snapshot wipes real P2P learned earlier.
+      if (connected.size === 0 && !row.allowEmptyWithdrawal) continue;
+      if (this._writePeerSnapshot(
+        this.reportedConns,
+        groupKey,
+        peerId,
+        connected,
+        row.version,
+        updatedAt,
+        allowUnversionedReplace,
+      )) {
+        changed = true;
+        changedPeerIds.add(peerId);
+        for (const dst of connected) changedPeerIds.add(Number(dst));
       }
     }
     if (!changed) return false;
-    this._writeUndirected(this.reportedConns, groupKey, fromPeerId, merged);
-    this._bumpEdgeVersions(groupKey, [fromPeerId, ...connected]);
+    this._bumpEdgeVersions(groupKey, changedPeerIds);
     this.persistTopology();
     this._notifyTopology(groupKey);
     return true;
   }
 
+  ingestOspfEdges(groupKey, fromPeerId, edges, version = 0, updatedAt = Date.now()) {
+    const connected = this._connectedSetFromEdges(fromPeerId, edges);
+    return this._ingestOspfRows(groupKey, [{
+      peerId: Number(fromPeerId),
+      version,
+      connected,
+    }], updatedAt, true);
+  }
+
   ingestConnInfo(groupKey, fromPeerId, syncReq, rawSyncBytes) {
-    const edges = [];
-    if (syncReq && syncReq.connBitmap) {
-      edges.push(...parseConnBitmapEdges(syncReq.connBitmap, fromPeerId));
+    // conn_bitmap is a network-wide LSA and often echoes the relay star.
+    // Only the reporter's own row (conn_peer_list, else reporter-incident bits)
+    // is treated as a connection snapshot. Star-only rows must not wipe P2P.
+    if (hasConnPeerList(rawSyncBytes)) {
+      const reporter = Number(fromPeerId);
+      const rows = connRowsFromPeerList(parseConnPeerList(rawSyncBytes))
+        .filter((row) => Number(row.peerId) === reporter)
+        .map((row) => {
+          const raw = Array.from(row.connected || []).map(Number);
+          const p2p = raw.filter((n) => n && n !== reporter && n !== MY_PEER_ID);
+          const starOnly = p2p.length === 0 && raw.some((n) => n === MY_PEER_ID);
+          return {
+            peerId: reporter,
+            version: row.version,
+            connected: new Set(p2p),
+            allowEmptyWithdrawal: p2p.length === 0 && !starOnly,
+          };
+        })
+        .filter((row) => row.allowEmptyWithdrawal || row.connected.size > 0);
+      this._ingestOspfRows(groupKey, rows, Date.now(), true);
+    } else if (syncReq && syncReq.connBitmap) {
+      const edges = parseConnBitmapEdges(syncReq.connBitmap, fromPeerId);
+      const connected = this._connectedSetFromEdges(fromPeerId, edges);
+      if (connected.size > 0) {
+        this.ingestOspfEdges(groupKey, fromPeerId, edges);
+      }
     }
-    if (rawSyncBytes) {
-      const list = parseConnPeerList(rawSyncBytes);
-      edges.push(...edgesFromConnPeerList(list, fromPeerId));
-    }
-    this.ingestOspfEdges(groupKey, fromPeerId, edges);
     this.notePeerSync(fromPeerId);
   }
 
-  collectReportedEdges(groupKey) {
+  collectReportedEdges(groupKey, nowTs = Date.now()) {
     const live = new Set(this.listPeerIdsInGroup(groupKey).map(Number));
     live.add(MY_PEER_ID);
-    const pairSet = new Set();
-    const add = (src, dst) => {
+    const directed = new Map();
+    const addDir = (src, dst) => {
       const a = Number(src);
       const b = Number(dst);
       if (!live.has(a) || !live.has(b) || a === b || a === MY_PEER_ID || b === MY_PEER_ID) return;
-      const key = a < b ? `${a}-${b}` : `${b}-${a}`;
-      pairSet.add(key);
+      let set = directed.get(a);
+      if (!set) {
+        set = new Set();
+        directed.set(a, set);
+      }
+      set.add(b);
     };
-    for (const store of [this.peerCenterConns, this.reportedConns]) {
+    const pcMap = this._getConnMap(this.peerCenterConns, groupKey, false);
+    // Once a center map exists, OSPF conn_peer_list snapshots are stale
+    // leftovers (star LSAs never withdraw P2P). Flooding them recreates
+    // dead DIRECT hops. OSPF is only a bootstrap before the first map.
+    const stores = (pcMap && pcMap.size > 0)
+      ? [this.peerCenterConns]
+      : [this.reportedConns];
+    for (const store of stores) {
       const m = this._getConnMap(store, groupKey, false);
       if (!m) continue;
-      for (const [src, dsts] of m.entries()) {
-        for (const dst of dsts) add(src, dst);
+      for (const [src, snapshot] of m.entries()) {
+        const ttl = store === this.peerCenterConns ? this.peerCenterTtlMs : this.topologyTtlMs;
+        const liveReporter = live.has(Number(src));
+        // PeerCenter reports stop traversing WSS once P2P to the center exists.
+        // Expire only after the reporter itself has left; do not flap live nodes.
+        if (!liveReporter && nowTs - this._snapshotUpdatedAt(snapshot) > ttl) continue;
+        for (const dst of this._snapshotPeers(snapshot)) addDir(src, dst);
       }
     }
+    // One-sided PeerCenter/OSPF rows create fake DIRECT: the other node has
+    // no tunnel, overlay ping dies, and a working relay hop is skipped.
     const edges = [];
-    for (const key of pairSet) {
-      const [a, b] = key.split('-').map(Number);
-      edges.push([a, b]);
+    for (const [src, dests] of directed.entries()) {
+      for (const dst of dests) {
+        if (src < dst && directed.get(dst) && directed.get(dst).has(src)) {
+          edges.push([src, dst]);
+        }
+      }
     }
     return edges;
   }
 
   notePeerSync(peerId) {
     this.lastSyncByPeer.set(Number(peerId), Date.now());
+  }
+
+  notePeerCenterPull(peerId) {
+    this.peerCenterPulls += 1;
+    this.lastPeerCenterPullPeer = Number(peerId) || 0;
+  }
+
+  noteRpcError(error) {
+    if (error == null) {
+      this.lastRpcError = '';
+      return;
+    }
+    if (typeof error === 'string') this.lastRpcError = error;
+    else this.lastRpcError = JSON.stringify(error);
   }
 
   routeIdKey(routeId) {
@@ -584,10 +869,7 @@ export class PeerManager {
       this.instIdByGroup.delete(groupKey);
     }
     this._clearInstId(groupKey, peerId);
-    const reported = this._getReportedConns(groupKey, false);
-    if (reported) reported.delete(Number(peerId));
-    const center = this._getPeerCenterConns(groupKey, false);
-    if (center) center.delete(Number(peerId));
+    this._clearPeerFromTopology(groupKey, peerId, false);
     this.lastSyncByPeer.delete(Number(peerId));
     this.lastPeerCenterByPeer.delete(Number(peerId));
     return true;
@@ -617,6 +899,7 @@ export class PeerManager {
     this._clearInstId(groupKey, peerId);
     const center = this.peerCenterByGroup.get(String(groupKey || ''));
     if (center) center.globalPeerMap.delete(String(peerId));
+    this._clearPeerFromTopology(groupKey, peerId, false);
     this.pruneStalePeerInfos(groupKey);
     if (peers && peers.size > 0) this.bumpAllPeerConnVersions(groupKey);
     return oldWs;
@@ -688,7 +971,13 @@ export class PeerManager {
       peerIds: this.listAllPeerIds(),
       lastSync: Object.fromEntries(this.lastSyncByPeer.entries()),
       lastPeerCenter: Object.fromEntries(this.lastPeerCenterByPeer.entries()),
+      peerCenterId: this.pickPeerCenterId(),
+      peerCenterGraph: this.dumpPeerCenterGraph(),
       reportedEdges: this.collectAllReportedEdges(),
+      zstdDecompress: isZstdDecompressAvailable(),
+      peerCenterPulls: this.peerCenterPulls,
+      lastPeerCenterPullPeer: this.lastPeerCenterPullPeer,
+      lastRpcError: this.lastRpcError || '',
     };
   }
 
@@ -737,7 +1026,16 @@ export class PeerManager {
       s = { globalPeerMap: new Map(), digest: '0', lastTouch: Date.now() };
       this.peerCenterByGroup.set(k, s);
     }
-    s.lastTouch = Date.now();
+    const now = Date.now();
+    let expired = false;
+    for (const [peerId, info] of s.globalPeerMap.entries()) {
+      if (now - Number(info && info.lastSeen || 0) > this.peerCenterTtlMs) {
+        s.globalPeerMap.delete(peerId);
+        expired = true;
+      }
+    }
+    if (expired) s.digest = '0';
+    s.lastTouch = now;
     return s;
   }
 

@@ -18,3 +18,11 @@ export const PacketType = {
   KcpSrc: 11,
   KcpDst: 12,
 };
+
+// easytier-proto/build/rpc.rs assigns method indices as (enumerate + 1).
+export const RpcMethod = {
+  OspfSyncRouteInfo: 1,
+  DirectConnectorGetIpList: 1,
+  PeerCenterReportPeers: 1,
+  PeerCenterGetGlobalPeerMap: 2,
+};

@@ -2,7 +2,7 @@ import { bufferFromMessage, parseHeader } from './core/packet.js';
 import { PacketType, MY_PEER_ID } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
 import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';
-import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
+import { handleRpcReq, handleRpcResp, requestGlobalPeerMapFromCenter } from './core/rpc_handler.js';
 import { PeerManager } from './core/peer_manager.js';
 import { randomU64String, maybeDecryptIncoming } from './core/crypto.js';
 import {
@@ -54,6 +54,7 @@ export class RelayRoom {
     await this.ready;
     try {
       this.peerManager.broadcastRouteUpdate(this.types, undefined, undefined, { forceFull: false });
+      requestGlobalPeerMapFromCenter(this.peerManager, this.types);
     } catch (e) {
       console.error('alarm broadcast failed:', e);
     }

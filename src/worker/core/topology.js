@@ -65,6 +65,7 @@ function skipField(buf, pos, wireType) {
 function parsePeerConnInfo(buf) {
   let pos = 0;
   let peerId = null;
+  let version = 0;
   const connected = [];
   while (pos < buf.length) {
     const tag = readVarint(buf, pos);
@@ -89,6 +90,11 @@ function parsePeerConnInfo(buf) {
           const v = readVarint(inner, ip);
           if (!v) break;
           peerId = v.value;
+          ip = v.pos;
+        } else if (f === 2 && w === 0) {
+          const v = readVarint(inner, ip);
+          if (!v) break;
+          version = v.value;
           ip = v.pos;
         } else {
           ip = skipField(inner, ip, w);
@@ -116,7 +122,7 @@ function parsePeerConnInfo(buf) {
       pos = skipField(buf, pos, wire);
     }
   }
-  return peerId == null ? null : { peerId, connected };
+  return peerId == null ? null : { peerId, version, connected };
 }
 
 export function parseConnPeerList(rawBytes) {
@@ -172,6 +178,35 @@ export function edgesFromConnPeerList(infos, reporterPeerId) {
     }
   }
   return edges;
+}
+
+export function connRowsFromPeerList(infos) {
+  return (infos || []).map((info) => ({
+    peerId: Number(info.peerId),
+    version: Number(info.version) || 0,
+    connected: new Set((info.connected || []).map(Number)),
+  }));
+}
+
+export function hasConnPeerList(rawBytes) {
+  if (!rawBytes || !rawBytes.length) return false;
+  const buf = Buffer.isBuffer(rawBytes) ? rawBytes : Buffer.from(rawBytes);
+  let pos = 0;
+  while (pos < buf.length) {
+    const tag = readVarint(buf, pos);
+    if (!tag) return false;
+    pos = tag.pos;
+    const field = tag.value >>> 3;
+    const wire = tag.value & 7;
+    if (field === 7 && wire === 2) {
+      const len = readVarint(buf, pos);
+      return !!len && len.pos + len.value <= buf.length;
+    }
+    const next = skipField(buf, pos, wire);
+    if (next > buf.length) return false;
+    pos = next;
+  }
+  return false;
 }
 
 export function buildStarAndReportedBitmap(peerIds, reportedEdges, relayPeerId) {

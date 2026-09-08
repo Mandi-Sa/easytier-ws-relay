@@ -14,6 +14,7 @@
   "license": "ISC",
   "dependencies": {
     "dotenv": "^16.4.5",
+    "fzstd": "^0.1.1",
     "protobufjs": "^8.0.0",
     "uuid": "^13.0.0",
     "ws": "^8.18.3"
